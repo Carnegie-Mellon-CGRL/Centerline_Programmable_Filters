@@ -1,0 +1,84 @@
+
+
+import vtk
+
+# Get input and output
+input_data = self.GetInput()
+output_data = self.GetOutput()
+
+# Tolerance for connecting endpoints
+tolerance = 0.01  # Adjust based on your geometry scale
+
+# Step 1: Identify endpoints (points with only one connected cell)
+endpoint_ids = []
+for i in range(input_data.GetNumberOfPoints()):
+    cell_ids = vtk.vtkIdList()
+    input_data.GetPointCells(i, cell_ids)
+    if cell_ids.GetNumberOfIds() == 1:
+        endpoint_ids.append(i)
+
+# Step 2: Build locator for fast spatial queries
+locator = vtk.vtkPointLocator()
+locator.SetDataSet(input_data)
+locator.BuildLocator()
+
+# Step 3: Create a copy of the original geometry
+points = vtk.vtkPoints()
+points.DeepCopy(input_data.GetPoints())
+
+lines = vtk.vtkCellArray()
+lines.DeepCopy(input_data.GetLines())
+
+# Step 4: Copy original CenterlineIds
+centerline_ids_array = input_data.GetCellData().GetArray("CenterlineIds")
+new_centerline_ids = vtk.vtkIntArray()
+new_centerline_ids.SetName("CenterlineIds")
+new_centerline_ids.SetNumberOfComponents(1)
+
+# Copy existing CenterlineIds
+for i in range(input_data.GetNumberOfCells()):
+    new_centerline_ids.InsertNextValue(centerline_ids_array.GetValue(i))
+
+# Step 5: Connect endpoints that are close to each other
+connected = set()
+next_id = centerline_ids_array.GetMaxId() + 1  # Start new IDs from max existing + 1
+
+for i in range(len(endpoint_ids)):
+    id1 = endpoint_ids[i]
+    p1 = input_data.GetPoint(id1)
+    for j in range(i + 1, len(endpoint_ids)):
+        id2 = endpoint_ids[j]
+        if id2 in connected or id1 in connected:
+            continue
+        p2 = input_data.GetPoint(id2)
+        dist = ((p1[0] - p2[0])**2 +
+                (p1[1] - p2[1])**2 +
+                (p1[2] - p2[2])**2)**0.5
+        if dist < tolerance:
+            # Connect the two endpoints with a line
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, id1)
+            line.GetPointIds().SetId(1, id2)
+            lines.InsertNextCell(line)
+            new_centerline_ids.InsertNextValue(next_id)
+            next_id += 1
+            connected.add(id1)
+            connected.add(id2)
+
+# Step 6: Output the updated geometry
+output_data.SetPoints(points)
+output_data.SetLines(lines)
+output_data.GetCellData().AddArray(new_centerline_ids)
+
+
+# Check for CellDataArrays
+
+input = self.GetInputDataObject(0, 0)
+
+print("PointData Arrays:")
+for i in range(input.GetPointData().GetNumberOfArrays()):
+    print(f"  {input.GetPointData().GetArray(i).GetName()}")
+
+print("CellData Arrays:")
+for i in range(input.GetCellData().GetNumberOfArrays()):
+    print(f"  {input.GetCellData().GetArray(i).GetName()}")

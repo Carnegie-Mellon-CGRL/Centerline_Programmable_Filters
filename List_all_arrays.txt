@@ -1,0 +1,10 @@
+
+input = self.GetInputDataObject(0, 0)
+
+print("PointData Arrays:")
+for i in range(input.GetPointData().GetNumberOfArrays()):
+    print(f"  {input.GetPointData().GetArray(i).GetName()}")
+
+print("CellData Arrays:")
+for i in range(input.GetCellData().GetNumberOfArrays()):
+    print(f"  {input.GetCellData().GetArray(i).GetName()}")

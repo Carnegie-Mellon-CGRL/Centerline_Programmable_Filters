@@ -1,0 +1,144 @@
+
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# Get input data
+input = self.GetInputDataObject(0, 0)
+
+# Find the point closest to the inlet coordinates
+target_coord = np.array([-1.73092, 7.91179, 0.0442764])
+min_dist = float('inf')
+inlet_index = None
+
+# Get 'CenterlineIds' from CellData
+id_array = input.GetCellData().GetArray("CenterlineIds")
+if id_array is None:
+    raise RuntimeError("CenterlineIds array not found in CellData.")
+
+ids = numpy_support.vtk_to_numpy(id_array)
+
+# Build connectivity map from cells
+connectivity = {i: [] for i in range(input.GetNumberOfPoints())}
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    num_pts = cell.GetNumberOfPoints()
+    for i in range(num_pts - 1):
+        p1 = cell.GetPointId(i)
+        p2 = cell.GetPointId(i + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# Map cell IDs to point IDs
+point_ids = np.full(input.GetNumberOfPoints(), -1)
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    for i in range(cell.GetNumberOfPoints()):
+        pid = cell.GetPointId(i)
+        point_ids[pid] = ids[cell_id]
+
+
+
+for i in range(input.GetNumberOfPoints()):
+    pt = np.array(input.GetPoint(i))
+    dist = np.linalg.norm(pt - target_coord)
+    if dist < min_dist:
+        min_dist = dist
+        inlet_index = i
+
+# Identify outlet points (one neighbor, not inlet)
+outlet_indices = [i for i in range(input.GetNumberOfPoints()) if len(connectivity[i]) == 1 and i != inlet_index]
+
+# Mark inlet and outlet points
+inlet_array = np.zeros(input.GetNumberOfPoints())
+outlet_array = np.zeros(input.GetNumberOfPoints())
+
+inlet_array[inlet_index] = 1
+for oid in outlet_indices:
+    outlet_array[oid] = 1
+
+inlet_vtk = numpy_support.numpy_to_vtk(inlet_array)
+inlet_vtk.SetName("IsInlet")
+self.GetOutput().GetPointData().AddArray(inlet_vtk)
+
+outlet_vtk = numpy_support.numpy_to_vtk(outlet_array)
+outlet_vtk.SetName("IsOutlet")
+self.GetOutput().GetPointData().AddArray(outlet_vtk)
+
+# Function to find shortest path using BFS
+def bfs_path(start, goal, connectivity):
+    visited = set()
+    queue = deque([[start]])
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+        if node == goal:
+            return path
+        if node not in visited:
+            visited.add(node)
+            for neighbor in connectivity[node]:
+                if neighbor not in visited:
+                    new_path = list(path)
+                    new_path.append(neighbor)
+                    queue.append(new_path)
+    return []
+
+# Initialize segment distance array
+segment_distance = np.full(input.GetNumberOfPoints(), -1.0)
+
+# Find paths and compute distances
+for outlet in outlet_indices:
+    path = bfs_path(inlet_index, outlet, connectivity)
+    if not path:
+        continue
+
+    cumulative = 0.0
+    for i in range(len(path)):
+        if i > 0:
+            p1 = np.array(input.GetPoint(path[i - 1]))
+            p2 = np.array(input.GetPoint(path[i]))
+            cumulative += np.linalg.norm(p2 - p1)
+
+        # Store shortest segment distance
+        if segment_distance[path[i]] < 0 or cumulative < segment_distance[path[i]]:
+            segment_distance[path[i]] = cumulative
+
+
+# Compute straight-line distance from inlet for each point
+straight_line_distance = np.zeros(input.GetNumberOfPoints())
+inlet_coord = np.array(input.GetPoint(inlet_index))
+
+for i in range(input.GetNumberOfPoints()):
+    pt = np.array(input.GetPoint(i))
+    straight_line_distance[i] = np.linalg.norm(pt - inlet_coord)
+
+# Add linear distance array to output
+linear_vtk = numpy_support.numpy_to_vtk(straight_line_distance)
+linear_vtk.SetName("LinearDistanceFromInlet")
+self.GetOutput().GetPointData().AddArray(linear_vtk)
+
+# Compute tortuosity: segmental / straight-line
+tortuosity = np.full(input.GetNumberOfPoints(), -1.0)
+for i in range(input.GetNumberOfPoints()):
+    seg_dist = segment_distance[i]
+    straight_dist = straight_line_distance[i]
+    if seg_dist > 0 and straight_dist > 0:
+        tortuosity[i] = seg_dist / straight_dist
+
+# Add tortuosity array to output
+tortuosity_vtk = numpy_support.numpy_to_vtk(tortuosity)
+tortuosity_vtk.SetName("Tortuosity")
+self.GetOutput().GetPointData().AddArray(tortuosity_vtk)
+
+
+
+# Add segment distance array to output
+segment_vtk = numpy_support.numpy_to_vtk(segment_distance)
+segment_vtk.SetName("CenterlineLength")
+self.GetOutput().GetPointData().AddArray(segment_vtk)
+
+# Summary
+print(f"Inlet point index: {inlet_index}")
+print(f"Number of outlet points: {len(outlet_indices)}")
+print("SegmentDistanceFromInlet array added.")

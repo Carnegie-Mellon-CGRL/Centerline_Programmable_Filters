@@ -1,0 +1,114 @@
+
+import numpy as np
+import vtk
+from collections import defaultdict
+
+# Get input centerline and surface mesh from grouped inputs
+grouped_input = self.GetInputDataObject(0, 0)
+centerlines = grouped_input.GetBlock(0)
+surface_mesh = grouped_input.GetBlock(1)
+
+# Arc Length Calculation
+arc_length_filter = vtk.vtkAppendArcLength()
+arc_length_filter.SetInputData(centerlines)
+arc_length_filter.Update()
+centerlines = arc_length_filter.GetOutput()
+
+# Get the total number of points in centerline
+num_points = centerlines.GetNumberOfPoints()
+
+# Create arrays to store cross-sectional areas and arc lengths
+area_array = vtk.vtkDoubleArray()
+area_array.SetName("CrossSectionalArea")
+area_array.SetNumberOfComponents(1)
+area_array.SetNumberOfTuples(num_points)
+
+# Create array to store average WSS magnitudes
+wss_array = vtk.vtkDoubleArray()
+wss_array.SetName("AverageWSS")
+wss_array.SetNumberOfComponents(1)
+wss_array.SetNumberOfTuples(num_points)
+
+
+print("Starting area computation...")
+
+# ---- Area computation loop ----
+for i in range(num_points):
+    print(f"Processing point {i+1} of {num_points}")
+
+    if i == 0 or i == num_points - 1:
+        area_array.SetValue(i, 0.0)
+        continue
+
+    p_prev = np.array(centerlines.GetPoint(i - 1))
+    p_curr = np.array(centerlines.GetPoint(i))
+    p_next = np.array(centerlines.GetPoint(i + 1))
+
+    tangent = p_next - p_prev
+    tangent /= np.linalg.norm(tangent)
+
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(p_curr)
+    plane.SetNormal(tangent)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetCutFunction(plane)
+    cutter.SetInputData(surface_mesh)
+    cutter.Update()
+    cut_polydata = cutter.GetOutput()
+
+    region_filter = vtk.vtkPolyDataConnectivityFilter()
+    region_filter.SetInputData(cut_polydata)
+    region_filter.SetExtractionModeToClosestPointRegion()
+    region_filter.SetClosestPoint(p_curr)
+    region_filter.Update()
+    filtered_cut = region_filter.GetOutput()
+
+    if filtered_cut.GetNumberOfCells() == 0:
+        print(f"Warning: No valid region at point {i}")
+        area_array.SetValue(i, 0.0)
+        continue
+
+    triangulator = vtk.vtkContourTriangulator()
+    triangulator.SetInputData(filtered_cut)
+    triangulator.Update()
+    triangulated = triangulator.GetOutput()
+
+    print(f"Triangulated: {triangulated.GetNumberOfCells()} cells")
+
+    mass_props = vtk.vtkMassProperties()
+    mass_props.SetInputData(triangulated)
+    area = mass_props.GetSurfaceArea()
+    area_array.SetValue(i, area)
+
+    print(f"Computed area at point {i}: {area}")
+
+    # Now computes WSS
+
+    wss_data = filtered_cut.GetPointData().GetVectors("vWSS")
+    if wss_data is None:
+        print(f"Warning: No WSS data at point {i}")
+        wss_array.SetValue(i, 0.0)
+        continue
+
+    magnitudes = []
+    for j in range(filtered_cut.GetNumberOfPoints()):
+        wss_vector = np.array(wss_data.GetTuple(j))
+        mag = np.linalg.norm(wss_vector)
+        if mag > 1e-8: #Filter out near-zero vectors
+            magnitudes.append(mag)
+    if magnitudes:
+        avg_wss = np.mean(magnitudes)
+    else:
+        avg_wss = 0.0
+
+    wss_array.SetValue(i, avg_wss)
+
+# ---- Finalize output ----
+centerlines.GetPointData().AddArray(area_array)
+centerlines.GetPointData().AddArray(wss_array)
+
+
+output.Initialize()
+output.SetNumberOfBlocks(1)
+output.SetBlock(0, centerlines)

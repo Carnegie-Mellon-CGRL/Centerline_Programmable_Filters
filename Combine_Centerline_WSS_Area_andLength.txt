@@ -1,0 +1,45 @@
+import vtk
+import numpy as np
+from vtkmodules.util import numpy_support
+
+# --- Inputs ---
+input0 = self.GetInputDataObject(0, 0)  # reference geometry
+input1 = self.GetInputDataObject(0, 1)  # dataset providing extra arrays
+output = self.GetOutput()
+
+# --- Copy geometry from input0 ---
+output.DeepCopy(input0)
+
+# --- Build locator on input1 for coordinate-based matching ---
+locator = vtk.vtkPointLocator()
+locator.SetDataSet(input1)
+locator.BuildLocator()
+
+tol = 1e-6  # tolerance for coordinate matching
+
+# --- Map arrays from input1 to output (point data only) ---
+n_points = input0.GetNumberOfPoints()
+pointdata1 = input1.GetPointData()
+
+for iarray in range(pointdata1.GetNumberOfArrays()):
+    arr = pointdata1.GetArray(iarray)
+    name = arr.GetName()
+    ncomp = arr.GetNumberOfComponents()
+
+    # create a new vtk array for output
+    new_arr = vtk.vtkFloatArray()
+    new_arr.SetName(name)
+    new_arr.SetNumberOfComponents(ncomp)
+    new_arr.SetNumberOfTuples(n_points)
+
+    # for each point in input0, find closest in input1 and copy data
+    for pid in range(n_points):
+        coord = input0.GetPoint(pid)
+        match_id = locator.FindClosestPoint(coord)
+        dist = np.linalg.norm(np.array(coord) - np.array(input1.GetPoint(match_id)))
+        if dist < tol:
+            new_arr.SetTuple(pid, arr.GetTuple(match_id))
+        else:
+            new_arr.SetTuple(pid, (np.nan,) * ncomp)
+
+    output.GetPointData().AddArray(new_arr)
