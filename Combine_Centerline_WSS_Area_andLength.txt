@@ -1,3 +1,4 @@
+
 import vtk
 import numpy as np
 from vtkmodules.util import numpy_support
@@ -16,8 +17,7 @@ locator.SetDataSet(input1)
 locator.BuildLocator()
 
 tol = 1e-6  # tolerance for coordinate matching
-
-# --- Map arrays from input1 to output (point data only) ---
+# --- Map PointData arrays from input1 to output ---
 n_points = input0.GetNumberOfPoints()
 pointdata1 = input1.GetPointData()
 
@@ -26,13 +26,11 @@ for iarray in range(pointdata1.GetNumberOfArrays()):
     name = arr.GetName()
     ncomp = arr.GetNumberOfComponents()
 
-    # create a new vtk array for output
     new_arr = vtk.vtkFloatArray()
     new_arr.SetName(name)
     new_arr.SetNumberOfComponents(ncomp)
     new_arr.SetNumberOfTuples(n_points)
 
-    # for each point in input0, find closest in input1 and copy data
     for pid in range(n_points):
         coord = input0.GetPoint(pid)
         match_id = locator.FindClosestPoint(coord)
@@ -43,3 +41,26 @@ for iarray in range(pointdata1.GetNumberOfArrays()):
             new_arr.SetTuple(pid, (np.nan,) * ncomp)
 
     output.GetPointData().AddArray(new_arr)
+
+# --- Map CellData arrays from input1 to output ---
+n_cells = input0.GetNumberOfCells()
+celldata1 = input1.GetCellData()
+
+for iarray in range(celldata1.GetNumberOfArrays()):
+    arr = celldata1.GetArray(iarray)
+    name = arr.GetName()
+    ncomp = arr.GetNumberOfComponents()
+
+    new_arr = vtk.vtkFloatArray()
+    new_arr.SetName(name)
+    new_arr.SetNumberOfComponents(ncomp)
+    new_arr.SetNumberOfTuples(n_cells)
+
+    # Simple index-based mapping (assuming same cell order)
+    for cid in range(n_cells):
+        if cid < input1.GetNumberOfCells():
+            new_arr.SetTuple(cid, arr.GetTuple(cid))
+        else:
+            new_arr.SetTuple(cid, (np.nan,) * ncomp)
+
+    output.GetCellData().AddArray(new_arr)
