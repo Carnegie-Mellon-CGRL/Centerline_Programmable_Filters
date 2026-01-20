@@ -1,0 +1,126 @@
+
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# Get input and output
+input = self.GetInputDataObject(0, 0)
+output = self.GetOutput()
+
+# Deep copy input to output to preserve geometry and existing arrays
+output.DeepCopy(input)
+
+num_points = input.GetNumberOfPoints()
+
+# Get 'CenterlineIds' from PointData
+id_array = input.GetPointData().GetArray("CenterlineIds")
+if id_array is None:
+    raise RuntimeError("CenterlineIds array not found in PointData.")
+ids = numpy_support.vtk_to_numpy(id_array)
+
+# Get 'GroupIds' from PointData
+group_array = input.GetPointData().GetArray("GroupIds")
+if group_array is None:
+    raise RuntimeError("GroupIds array not found in PointData.")
+group_ids = numpy_support.vtk_to_numpy(group_array)
+
+# Build connectivity map from cells
+connectivity = {i: [] for i in range(num_points)}
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    num_pts = cell.GetNumberOfPoints()
+    for i in range(num_pts - 1):
+        p1 = cell.GetPointId(i)
+        p2 = cell.GetPointId(i + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# Find inlet point: first point with GroupId == 0
+inlet_index = None
+for pid in range(num_points):
+    if group_ids[pid] == 0:
+        inlet_index = pid
+        break
+
+if inlet_index is None:
+    raise RuntimeError("No inlet point found with GroupId == 0.")
+
+# Identify outlet points (one neighbor, not inlet)
+outlet_indices = [i for i in range(num_points) if len(connectivity[i]) == 1 and i != inlet_index]
+
+# Mark inlet and outlet points
+inlet_array = np.zeros(num_points)
+outlet_array = np.zeros(num_points)
+
+inlet_array[inlet_index] = 1
+for oid in outlet_indices:
+    outlet_array[oid] = 1
+
+inlet_vtk = numpy_support.numpy_to_vtk(inlet_array)
+inlet_vtk.SetName("IsInlet")
+output.GetPointData().AddArray(inlet_vtk)
+
+outlet_vtk = numpy_support.numpy_to_vtk(outlet_array)
+outlet_vtk.SetName("IsOutlet")
+output.GetPointData().AddArray(outlet_vtk)
+
+# BFS: compute distance from inlet to all reachable points
+def bfs_all_distances(start, connectivity, input):
+    visited = set()
+    queue = deque([(start, 0.0)])
+    distances = np.full(input.GetNumberOfPoints(), -1.0)
+    distances[start] = 0.0
+
+    while queue:
+        current, dist = queue.popleft()
+        visited.add(current)
+
+        for neighbor in connectivity[current]:
+            if neighbor not in visited:
+                p1 = np.array(input.GetPoint(current))
+                p2 = np.array(input.GetPoint(neighbor))
+                edge_length = np.linalg.norm(p2 - p1)
+                new_dist = dist + edge_length
+
+                if distances[neighbor] < 0 or new_dist < distances[neighbor]:
+                    distances[neighbor] = new_dist
+                    queue.append((neighbor, new_dist))
+
+    return distances
+
+# Compute segment distances from inlet
+segment_distance = bfs_all_distances(inlet_index, connectivity, input)
+
+# Compute straight-line distance from inlet
+straight_line_distance = np.zeros(num_points)
+inlet_coord = np.array(input.GetPoint(inlet_index))
+
+for i in range(num_points):
+    pt = np.array(input.GetPoint(i))
+    straight_line_distance[i] = np.linalg.norm(pt - inlet_coord)
+
+linear_vtk = numpy_support.numpy_to_vtk(straight_line_distance)
+linear_vtk.SetName("LinearDistanceFromInlet")
+output.GetPointData().AddArray(linear_vtk)
+
+# Compute tortuosity only for reachable points
+tortuosity = np.full(num_points, -1.0)
+for i in range(num_points):
+    seg_dist = segment_distance[i]
+    straight_dist = straight_line_distance[i]
+    if seg_dist >= 0 and straight_dist > 0:
+        tortuosity[i] = seg_dist / straight_dist
+
+tortuosity_vtk = numpy_support.numpy_to_vtk(tortuosity)
+tortuosity_vtk.SetName("Tortuosity")
+output.GetPointData().AddArray(tortuosity_vtk)
+
+segment_vtk = numpy_support.numpy_to_vtk(segment_distance)
+segment_vtk.SetName("CenterlineLength")
+output.GetPointData().AddArray(segment_vtk)
+
+# Summary
+print(f"Inlet point index (GroupId == 0): {inlet_index}")
+print(f"Number of outlet points: {len(outlet_indices)}")
+print("CenterlineLength and Tortuosity arrays added.")

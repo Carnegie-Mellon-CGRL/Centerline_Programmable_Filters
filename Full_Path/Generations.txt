@@ -1,0 +1,61 @@
+
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# Get input
+input = self.GetInput()
+
+# Get arrays
+points = input.GetPoints()
+num_points = input.GetNumberOfPoints()
+
+is_inlet_vtk = input.GetPointData().GetArray("IsInlet")
+if is_inlet_vtk is None:
+    raise RuntimeError("Required array 'IsInlet' not found.")
+
+is_inlet = numpy_support.vtk_to_numpy(is_inlet_vtk)
+
+# Build connectivity graph
+connectivity = {i: [] for i in range(num_points)}
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(j)
+        p2 = cell.GetPointId(j + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# Compute number of connections per point
+num_connections = np.array([len(connectivity[i]) for i in range(num_points)])
+
+# Initialize Generation array
+generation_array = np.full(num_points, -1, dtype=np.int32)  # -1 means unvisited
+
+# BFS traversal from inlet points
+inlet_indices = np.where(is_inlet == 1)[0]
+queue = deque()
+
+for inlet in inlet_indices:
+    generation_array[inlet] = 0
+    queue.append((inlet, 0, True))  # (point_id, generation, is_first_step)
+
+while queue:
+    current, gen, is_first_step = queue.popleft()
+    for neighbor in connectivity[current]:
+        if generation_array[neighbor] == -1:  # not visited
+            # Only increment generation if not the first step from inlet
+            if is_first_step:
+                next_gen = gen
+            else:
+                next_gen = gen + 1 if num_connections[neighbor] != num_connections[current] else gen
+            generation_array[neighbor] = next_gen
+            queue.append((neighbor, next_gen, False))
+
+# Attach Generation array
+generation_vtk = numpy_support.numpy_to_vtk(generation_array)
+generation_vtk.SetName("Generation")
+input.GetPointData().AddArray(generation_vtk)
+
+# Output
+output.ShallowCopy(input)

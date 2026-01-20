@@ -1,0 +1,140 @@
+
+import vtk
+from collections import deque
+
+# Parameters
+target_spacing = 0.01  # mm
+
+# Input
+input_data = self.GetInput()
+points = input_data.GetPoints()
+lines = input_data.GetLines()
+point_data = input_data.GetPointData()
+num_points = points.GetNumberOfPoints()
+num_arrays = point_data.GetNumberOfArrays()
+
+# Build connectivity graph
+connectivity = [[] for _ in range(num_points)]
+lines.InitTraversal()
+id_list = vtk.vtkIdList()
+while lines.GetNextCell(id_list):
+    for i in range(id_list.GetNumberOfIds() - 1):
+        a = id_list.GetId(i)
+        b = id_list.GetId(i + 1)
+        connectivity[a].append(b)
+        connectivity[b].append(a)
+
+# Find inlet and all outlets
+is_inlet = point_data.GetArray("IsInlet")
+is_outlet = point_data.GetArray("IsOutlet")
+inlet_id = next(i for i in range(num_points) if is_inlet and is_inlet.GetValue(i) == 1)
+outlet_ids = [i for i in range(num_points) if is_outlet and is_outlet.GetValue(i) == 1]
+
+# Prepare output containers
+new_points = vtk.vtkPoints()
+new_lines = vtk.vtkCellArray()
+new_point_data_arrays = []
+for a in range(num_arrays):
+    array = point_data.GetArray(a)
+    new_array = vtk.vtkDoubleArray()
+    new_array.SetName(array.GetName())
+    new_array.SetNumberOfComponents(array.GetNumberOfComponents())
+    new_point_data_arrays.append(new_array)
+
+# Helper functions
+def trace_path(inlet, outlet):
+    prev = [-1] * num_points
+    visited = [False] * num_points
+    queue = deque()
+    queue.append(inlet)
+    visited[inlet] = True
+
+    while queue:
+        current = queue.popleft()
+        if current == outlet:
+            break
+        for neighbor in connectivity[current]:
+            if not visited[neighbor]:
+                visited[neighbor] = True
+                prev[neighbor] = current
+                queue.append(neighbor)
+
+    path = []
+    current = outlet
+    while current != -1:
+        path.append(current)
+        current = prev[current]
+    path.reverse()
+    return path
+
+def interpolate_arrays(val0, val1, t):
+    return [val0[c] + (val1[c] - val0[c]) * t for c in range(len(val0))]
+
+def get_point_data(i):
+    return [[point_data.GetArray(a).GetComponent(i, c)
+             for c in range(point_data.GetArray(a).GetNumberOfComponents())]
+            for a in range(num_arrays)]
+
+def resample_path(path_ids):
+    arc_lengths = [0.0]
+    for i in range(1, len(path_ids)):
+        p0 = points.GetPoint(path_ids[i - 1])
+        p1 = points.GetPoint(path_ids[i])
+        dist = ((p1[0] - p0[0])**2 + (p1[1] - p0[1])**2 + (p1[2] - p0[2])**2)**0.5
+        arc_lengths.append(arc_lengths[-1] + dist)
+
+    total_length = arc_lengths[-1]
+    num_samples = int(total_length / target_spacing)
+    sample_distances = [i * target_spacing for i in range(num_samples + 1)]
+
+    segment_ids = []
+    j = 0
+    for d in sample_distances:
+        while j < len(arc_lengths) - 1 and arc_lengths[j + 1] < d:
+            j += 1
+        t = (d - arc_lengths[j]) / (arc_lengths[j + 1] - arc_lengths[j])
+        p0 = points.GetPoint(path_ids[j])
+        p1 = points.GetPoint(path_ids[j + 1])
+        pt = [p0[i] + t * (p1[i] - p0[i]) for i in range(3)]
+        pid = new_points.InsertNextPoint(pt)
+
+        # Interpolate PointData
+        data0 = get_point_data(path_ids[j])
+        data1 = get_point_data(path_ids[j + 1])
+        interpolated_data = [interpolate_arrays(data0[a], data1[a], t) for a in range(num_arrays)]
+        
+        # Apply rounding rules
+        for a, vals in enumerate(interpolated_data):
+            name = new_point_data_arrays[a].GetName()
+
+            if name == "capPoints":
+                vals = [1.0 if v >= 0.5 else 0.0 for v in vals]
+
+            elif name == "Blanking":
+                vals = [1.0 if v != 0.0 else 0.0 for v in vals]
+
+            new_point_data_arrays[a].InsertNextTuple(vals)
+
+
+        segment_ids.append(pid)
+
+    return segment_ids
+
+# Process each outlet
+for outlet_id in outlet_ids:
+    path_ids = trace_path(inlet_id, outlet_id)
+    segment_ids = resample_path(path_ids)
+
+    for i in range(len(segment_ids) - 1):
+        line = vtk.vtkLine()
+        line.GetPointIds().SetId(0, segment_ids[i])
+        line.GetPointIds().SetId(1, segment_ids[i + 1])
+        new_lines.InsertNextCell(line)
+
+# Output
+output_polydata = vtk.vtkPolyData()
+output_polydata.SetPoints(new_points)
+output_polydata.SetLines(new_lines)
+for array in new_point_data_arrays:
+    output_polydata.GetPointData().AddArray(array)
+output.ShallowCopy(output_polydata)

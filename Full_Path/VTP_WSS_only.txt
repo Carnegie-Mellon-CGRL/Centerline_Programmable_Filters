@@ -1,0 +1,235 @@
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# Get input blocks
+grouped_input = inputs[0]
+centerline = grouped_input.GetBlock(0)
+surface = grouped_input.GetBlock(1)
+
+# Get arrays
+centerline_points = numpy_support.vtk_to_numpy(centerline.GetPoints().GetData())
+filtered_radius_vtk = centerline.GetPointData().GetArray("Filtered_Radius")
+blanking_vtk = centerline.GetPointData().GetArray("Blanking")
+is_inlet_vtk = centerline.GetPointData().GetArray("IsInlet")
+is_outlet_vtk = centerline.GetPointData().GetArray("IsOutlet")
+
+if filtered_radius_vtk is None or blanking_vtk is None:
+    raise RuntimeError("Required arrays (Filtered_Radius, Blanking) not found.")
+
+filtered_radius = numpy_support.vtk_to_numpy(filtered_radius_vtk)
+blanking = numpy_support.vtk_to_numpy(blanking_vtk)
+is_inlet = numpy_support.vtk_to_numpy(is_inlet_vtk)
+is_outlet = numpy_support.vtk_to_numpy(is_outlet_vtk)
+
+num_points = centerline.GetNumberOfPoints()
+filtered_wss_array = np.zeros(num_points)
+clipping_flags_array = np.zeros(num_points, dtype=np.int8)  # New array to store use_clipping flags
+
+# --- Build connectivity graph ---
+connectivity = {i: [] for i in range(num_points)}
+for cell_id in range(centerline.GetNumberOfCells()):
+    cell = centerline.GetCell(cell_id)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(j)
+        p2 = cell.GetPointId(j + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# --- BFS path finder ---
+
+def find_path(connectivity, start, end):
+    visited = set()
+    queue = deque([[start]])
+
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+        if node == end:
+            return path
+        if node not in visited:
+            visited.add(node)
+            for neighbor in connectivity[node]:
+                new_path = list(path)
+                new_path.append(neighbor)
+                queue.append(new_path)
+    return []
+
+# --- DFS path finder ---
+
+
+def find_path_dfs(connectivity, start, end):
+    stack = [(start, [start])]
+    visited = set()
+
+    while stack:
+        node, path = stack.pop()
+        if node == end:
+            return path
+        if node not in visited:
+            visited.add(node)
+            for neighbor in connectivity[node]:
+                if neighbor not in visited:
+                    stack.append((neighbor, path + [neighbor]))
+    return []
+
+
+# --- Collect all valid inlet-to-outlet paths ---
+valid_path_points = set()
+inlet_indices = np.where(is_inlet == 1)[0]
+outlet_indices = np.where(is_outlet == 1)[0]
+
+for inlet in inlet_indices:
+    for outlet in outlet_indices:
+        path = find_path_dfs(connectivity, inlet, outlet)
+        valid_path_points.update(path)
+
+# --- Prepare output blocks ---
+output_blocks = vtk.vtkMultiBlockDataSet()
+output_blocks.SetNumberOfBlocks(2)
+output_blocks.SetBlock(0, centerline)
+
+clipped_collection = vtk.vtkAppendPolyData()
+
+for i in valid_path_points:
+    point = centerline_points[i]
+    radius = filtered_radius[i]
+    if radius <= 0:
+        radius = 1.0
+
+    # Estimate normal direction
+    if i > 0:
+        prev_point = centerline_points[i - 1]
+    else:
+        prev_point = centerline_points[i] - np.array([1, 0, 0])
+
+    normal = point - prev_point
+    norm = np.linalg.norm(normal)
+    if norm == 0 or np.isnan(norm):
+        continue
+    normal = normal / norm
+
+    # Slice surface
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(point)
+    plane.SetNormal(normal)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetCutFunction(plane)
+    cutter.SetInputData(surface)
+    cutter.Update()
+
+    # Apply region filter to isolate closest surface region
+    region_filter = vtk.vtkPolyDataConnectivityFilter()
+    region_filter.SetInputData(cutter.GetOutput())
+    region_filter.SetExtractionModeToClosestPointRegion()
+    region_filter.SetClosestPoint(point)
+    region_filter.Update()
+    filtered = region_filter.GetOutput()
+
+    # Compute inlet_radius
+    points_vtk = filtered.GetPoints()
+    slice_radius = 0.0
+    if points_vtk is not None and points_vtk.GetNumberOfPoints() > 0:
+        points_np = numpy_support.vtk_to_numpy(points_vtk.GetData())
+        distances = np.linalg.norm(points_np - point, axis=1)
+        slice_radius = np.max(distances)
+
+    # Decide whether to clip
+    use_clipping = slice_radius > 1.4 * radius
+    clipping_flags_array[i] = int(use_clipping)  # Store clipping flag
+    if use_clipping:
+        sphere = vtk.vtkSphere()
+        sphere.SetCenter(point)
+        sphere.SetRadius(radius)
+
+        clipper = vtk.vtkClipPolyData()
+        clipper.SetInputData(filtered)
+        clipper.SetClipFunction(sphere)
+        clipper.InsideOutOn()
+        clipper.Update()
+        clipped_slice = clipper.GetOutput()
+    else:
+        clipped_slice = filtered
+
+    # Compute WSS average
+    wss_data = clipped_slice.GetPointData().GetVectors("vWSS")
+    if wss_data is None:
+        filtered_wss_array[i] = 0.0
+        continue
+
+    magnitudes = []
+    for j in range(clipped_slice.GetNumberOfPoints()):
+        wss_vector = np.array(wss_data.GetTuple(j))
+        mag = np.linalg.norm(wss_vector)
+        if mag > 1e-8:
+            magnitudes.append(mag)
+
+
+    avg_wss = np.mean(magnitudes) if magnitudes else 0.0
+
+    # Check if clipping was used and WSS is zero
+    if use_clipping and avg_wss == 0.0:
+        print(f"[Point {i}] WSS was zero after clipping — retrying with larger radius.")
+
+        # Retry with larger sphere
+        new_radius = 1.5 * radius
+        sphere = vtk.vtkSphere()
+        sphere.SetCenter(point)
+        sphere.SetRadius(new_radius)
+
+        clipper = vtk.vtkClipPolyData()
+        clipper.SetInputData(filtered)
+        clipper.SetClipFunction(sphere)
+        clipper.InsideOutOn()
+        clipper.Update()
+        clipped_slice_retry = clipper.GetOutput()
+
+        # Recompute WSS
+        wss_data_retry = clipped_slice_retry.GetPointData().GetVectors("vWSS")
+        if wss_data_retry is not None:
+            magnitudes_retry = []
+            for j in range(clipped_slice_retry.GetNumberOfPoints()):
+                wss_vector = np.array(wss_data_retry.GetTuple(j))
+                mag = np.linalg.norm(wss_vector)
+                if mag > 1e-8:
+                    magnitudes_retry.append(mag)
+            avg_wss = np.mean(magnitudes_retry) if magnitudes_retry else 0.0
+        filtered_radius[i] = new_radius
+    filtered_wss_array[i] = avg_wss
+
+
+# Attach arrays
+wss_vtk = numpy_support.numpy_to_vtk(filtered_wss_array)
+wss_vtk.SetName("Filtered_AverageWSS")
+centerline.GetPointData().AddArray(wss_vtk)
+
+clipping_flags_vtk = numpy_support.numpy_to_vtk(clipping_flags_array)
+clipping_flags_vtk.SetName("Use_Clipping_Flag")
+centerline.GetPointData().AddArray(clipping_flags_vtk)
+
+
+# Final pass: fix any zero WSS values by averaging neighbors
+for i in range(num_points):
+    if filtered_wss_array[i] == 0.0:
+        neighbors = connectivity.get(i, [])
+        neighbor_values = [filtered_wss_array[n] for n in neighbors if filtered_wss_array[n] > 0.0]
+        if neighbor_values:
+            avg_neighbor_wss = np.mean(neighbor_values)
+            filtered_wss_array[i] = avg_neighbor_wss
+            print(f"[Point {i}] WSS was zero — replaced with average of neighbors: {avg_neighbor_wss}")
+        else:
+            print(f"[Point {i}] WSS was zero and no valid neighbors found — value remains 0.")
+
+# Update the array with fixed values
+wss_vtk_fixed = numpy_support.numpy_to_vtk(filtered_wss_array)
+wss_vtk_fixed.SetName("Filtered_AverageWSS")
+centerline.GetPointData().AddArray(wss_vtk_fixed)
+
+filtered_radius_vtk_updated = numpy_support.numpy_to_vtk(filtered_radius)
+filtered_radius_vtk_updated.SetName("Filtered_Radius")
+centerline.GetPointData().AddArray(filtered_radius_vtk_updated)
+
+# Output
+output.ShallowCopy(centerline)

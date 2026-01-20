@@ -1,0 +1,146 @@
+
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# -------------------------------------------------------------------------
+# Input / Output (as requested)
+# -------------------------------------------------------------------------
+input = self.GetInputDataObject(0, 0)
+output = self.GetOutput()
+output.DeepCopy(input)
+
+poly = input
+num_points = poly.GetNumberOfPoints()
+
+# -------------------------------------------------------------------------
+# Required Point Data Arrays
+# -------------------------------------------------------------------------
+pd = poly.GetPointData()
+
+filtered_area_vtk = pd.GetArray("Filtered_Area")
+blanking_vtk = pd.GetArray("Blanking")
+is_inlet_vtk = pd.GetArray("IsInlet")
+is_outlet_vtk = pd.GetArray("IsOutlet")
+velocity_vtk = pd.GetArray("velocity")
+pressure_vtk = pd.GetArray("Pressure (mmHg)")
+
+if (filtered_area_vtk is None or blanking_vtk is None or
+    velocity_vtk is None or pressure_vtk is None or
+    is_inlet_vtk is None or is_outlet_vtk is None):
+    raise RuntimeError("Missing required Point Data arrays.")
+
+# -------------------------------------------------------------------------
+# Convert to NumPy
+# -------------------------------------------------------------------------
+points_np = numpy_support.vtk_to_numpy(poly.GetPoints().GetData())
+filtered_area = numpy_support.vtk_to_numpy(filtered_area_vtk)
+blanking = numpy_support.vtk_to_numpy(blanking_vtk)
+is_inlet = numpy_support.vtk_to_numpy(is_inlet_vtk)
+is_outlet = numpy_support.vtk_to_numpy(is_outlet_vtk)
+velocity_np = numpy_support.vtk_to_numpy(velocity_vtk)
+pressure_np = numpy_support.vtk_to_numpy(pressure_vtk)
+
+# -------------------------------------------------------------------------
+# Allocate Output Arrays
+# -------------------------------------------------------------------------
+flow_array = np.zeros(num_points)
+power_array = np.zeros(num_points)
+resistance_array = np.zeros(num_points)
+normals_array = np.zeros((num_points, 3))
+
+# -------------------------------------------------------------------------
+# Build Connectivity Graph (once)
+# -------------------------------------------------------------------------
+connectivity = {i: [] for i in range(num_points)}
+
+for cell_id in range(poly.GetNumberOfCells()):
+    cell = poly.GetCell(cell_id)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(j)
+        p2 = cell.GetPointId(j + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# -------------------------------------------------------------------------
+# BFS for inlet → outlet paths
+# -------------------------------------------------------------------------
+def find_path(connectivity, start, end):
+    visited = set()
+    queue = deque([[start]])
+
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+
+        if node == end:
+            return path
+
+        if node not in visited:
+            visited.add(node)
+            for neighbor in connectivity[node]:
+                queue.append(path + [neighbor])
+
+    return []
+
+# -------------------------------------------------------------------------
+# Identify Valid Path Points
+# -------------------------------------------------------------------------
+valid_path_points = set()
+inlet_indices = np.where(is_inlet == 1)[0]
+outlet_indices = np.where(is_outlet == 1)[0]
+
+for inlet in inlet_indices:
+    for outlet in outlet_indices:
+        path = find_path(connectivity, inlet, outlet)
+        valid_path_points.update(path)
+
+# -------------------------------------------------------------------------
+# Compute Flow (DOT PRODUCT), Power, Resistance
+# -------------------------------------------------------------------------
+for i in valid_path_points:
+    # Estimate local tangent / normal
+    if i > 0:
+        prev_point = points_np[i - 1]
+    else:
+        prev_point = points_np[i] - np.array([1.0, 0.0, 0.0])
+
+    tangent = points_np[i] - prev_point
+    norm = np.linalg.norm(tangent)
+
+    if norm == 0.0 or np.isnan(norm):
+        continue
+
+    normal = tangent / norm
+    normals_array[i] = normal
+
+    # Dot-product directional velocity
+    v_vec = velocity_np[i]
+    v_normal = np.dot(v_vec, normal)
+
+    area = filtered_area[i]
+    if area <= 0.0:
+        continue
+
+    # FLOW = (v · n) * A   <-- REQUIRED
+    flow = v_normal * area
+    flow_array[i] = flow
+
+    if abs(flow) > 1e-8:
+        power_array[i] = pressure_np[i] * flow
+        resistance_array[i] = pressure_np[i] / flow
+
+# -------------------------------------------------------------------------
+# Attach New Arrays (preserve all existing data)
+# -------------------------------------------------------------------------
+def add_array(name, np_array, num_comps=1):
+    vtk_arr = numpy_support.numpy_to_vtk(np_array, deep=1)
+    vtk_arr.SetName(name)
+    vtk_arr.SetNumberOfComponents(num_comps)
+    output.GetPointData().AddArray(vtk_arr)
+
+add_array("Flow", flow_array)
+add_array("Power", power_array)
+add_array("Resistance", resistance_array)
+add_array("Slice_Normal", normals_array, 3)

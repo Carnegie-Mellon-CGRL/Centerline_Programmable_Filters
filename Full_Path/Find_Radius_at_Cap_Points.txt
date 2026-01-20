@@ -1,0 +1,192 @@
+
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# Get input blocks
+grouped_input = inputs[0]
+centerline = grouped_input.GetBlock(0)
+surface = grouped_input.GetBlock(1)
+
+# Get centerline arrays
+centerline_points = numpy_support.vtk_to_numpy(centerline.GetPoints().GetData())
+cap_array_vtk = centerline.GetPointData().GetArray("CapPoints")
+is_inlet_vtk = centerline.GetPointData().GetArray("IsInlet")
+is_outlet_vtk = centerline.GetPointData().GetArray("IsOutlet")
+
+if cap_array_vtk is None or is_inlet_vtk is None or is_outlet_vtk is None:
+    raise RuntimeError("Required arrays (CapPoints, IsInlet, IsOutlet) not found.")
+
+cap_array = numpy_support.vtk_to_numpy(cap_array_vtk)
+is_inlet = numpy_support.vtk_to_numpy(is_inlet_vtk)
+is_outlet = numpy_support.vtk_to_numpy(is_outlet_vtk)
+
+num_points = centerline.GetNumberOfPoints()
+
+# --- Step 1: Compute radius at each CapPoint ---
+radius_map = {}
+for i in range(num_points):
+    if cap_array[i] != 1:
+        continue
+
+    # Find previous connected centerline point
+    prev_point = None
+    for cell_id in range(centerline.GetNumberOfCells()):
+        cell = centerline.GetCell(cell_id)
+        ids = [cell.GetPointId(j) for j in range(cell.GetNumberOfPoints())]
+        if i in ids:
+            idx = ids.index(i)
+            if idx > 0:
+                prev_id = ids[idx - 1]
+                prev_point = centerline_points[prev_id]
+                break
+    if prev_point is None:
+        continue
+
+    normal = centerline_points[i] - prev_point
+    norm = np.linalg.norm(normal)
+    if norm == 0:
+        continue
+    normal = normal / norm
+
+    # Slice the surface
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(centerline_points[i])
+    plane.SetNormal(normal)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetCutFunction(plane)
+    cutter.SetInputData(surface)
+    cutter.Update()
+
+    cleaner = vtk.vtkCleanPolyData()
+    cleaner.SetInputData(cutter.GetOutput())
+    cleaner.Update()
+
+    region_filter = vtk.vtkPolyDataConnectivityFilter()
+    region_filter.SetInputData(cleaner.GetOutput())
+    region_filter.SetExtractionModeToClosestPointRegion()
+    region_filter.SetClosestPoint(centerline_points[i])
+    region_filter.Update()
+
+    filtered = region_filter.GetOutput()
+    points_vtk = filtered.GetPoints()
+    if points_vtk is None or points_vtk.GetNumberOfPoints() == 0:
+        continue
+
+    points_np = numpy_support.vtk_to_numpy(points_vtk.GetData())
+    distances = np.linalg.norm(points_np - centerline_points[i], axis=1)
+    max_radius = np.max(distances)
+
+    radius_map[i] = max_radius
+
+# --- Step 1.5: Compute inlet radius ---
+inlet_indices = np.where(is_inlet == 1)[0]
+inlet_radius = None
+
+if len(inlet_indices) > 0:
+    inlet_id = inlet_indices[0]
+    # Find next connected point
+    next_point = None
+    for cell_id in range(centerline.GetNumberOfCells()):
+        cell = centerline.GetCell(cell_id)
+        ids = [cell.GetPointId(j) for j in range(cell.GetNumberOfPoints())]
+        if inlet_id in ids:
+            idx = ids.index(inlet_id)
+            if idx < len(ids) - 1:
+                next_id = ids[idx + 1]
+                next_point = centerline_points[next_id]
+                break
+    if next_point is not None:
+        normal = next_point - centerline_points[inlet_id]
+        norm = np.linalg.norm(normal)
+        if norm != 0:
+            normal = normal / norm
+
+            plane = vtk.vtkPlane()
+            plane.SetOrigin(centerline_points[inlet_id])
+            plane.SetNormal(normal)
+ 
+            cutter = vtk.vtkCutter()
+            cutter.SetCutFunction(plane)
+            cutter.SetInputData(surface)
+            cutter.Update()
+
+            cleaner = vtk.vtkCleanPolyData()
+            cleaner.SetInputData(cutter.GetOutput())
+            cleaner.Update()
+
+            region_filter = vtk.vtkPolyDataConnectivityFilter()
+            region_filter.SetInputData(cleaner.GetOutput())
+            region_filter.SetExtractionModeToClosestPointRegion()
+            region_filter.SetClosestPoint(centerline_points[inlet_id])
+            region_filter.Update()
+
+            filtered = region_filter.GetOutput()
+            points_vtk = filtered.GetPoints()
+            if points_vtk is not None and points_vtk.GetNumberOfPoints() > 0:
+                points_np = numpy_support.vtk_to_numpy(points_vtk.GetData())
+                distances = np.linalg.norm(points_np - centerline_points[inlet_id], axis=1)
+                inlet_radius = np.max(distances)
+
+# --- Step 2: Build connectivity graph ---
+connectivity = {i: [] for i in range(num_points)}
+for cell_id in range(centerline.GetNumberOfCells()):
+    cell = centerline.GetCell(cell_id)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(j)
+        p2 = cell.GetPointId(j + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# --- Step 3: Traverse each inlet-to-outlet path and reassess radius ---
+def find_path_iterative(connectivity, start, end):
+    """Iterative DFS to find a path from start to end."""
+    stack = [(start, [start])]
+    visited = set()
+
+    while stack:
+        current, path = stack.pop()
+        if current == end:
+            return path
+        if current in visited:
+            continue
+        visited.add(current)
+        for neighbor in connectivity[current]:
+            if neighbor not in visited:
+                stack.append((neighbor, path + [neighbor]))
+    return []
+
+
+filtered_radius_array = np.zeros(num_points)
+
+for inlet in inlet_indices:
+    for outlet in np.where(is_outlet == 1)[0]:
+        path = find_path_iterative(connectivity, inlet, outlet)
+        if not path:
+            continue  # Skip if no path found
+
+        current_radius = inlet_radius  # Start with inlet radius
+
+        for point_id in path:
+            # Reassess radius at CapPoints
+            if cap_array[point_id] == 1 and point_id in radius_map:
+                new_radius = radius_map[point_id]
+                if current_radius is None or new_radius <= 1.3 * current_radius:
+                    current_radius = new_radius
+                else:
+                    # Skip updating radius if it grows too much
+                    pass
+
+            # Assign current radius if available
+            if current_radius is not None:
+                filtered_radius_array[point_id] = current_radius
+
+# --- Step 4: Attach FilteredRadius array to output ---
+filtered_vtk = numpy_support.numpy_to_vtk(filtered_radius_array)
+filtered_vtk.SetName("Filtered_Radius")
+centerline.GetPointData().AddArray(filtered_vtk)
+
+# Final output
+output.ShallowCopy(centerline)

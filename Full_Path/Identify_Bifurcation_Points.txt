@@ -1,0 +1,120 @@
+
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# Get input and output
+input = self.GetInputDataObject(0, 0)
+output = self.GetOutput()
+output.DeepCopy(input)
+
+# Get required arrays
+id_array = input.GetCellData().GetArray("CenterlineIds")
+group_array = input.GetCellData().GetArray("GroupIds")
+blanking_array = input.GetCellData().GetArray("Blanking")
+is_inlet_array = input.GetPointData().GetArray("IsInlet")
+is_outlet_array = input.GetPointData().GetArray("IsOutlet")
+
+if id_array is None or group_array is None or blanking_array is None or is_inlet_array is None or is_outlet_array is None:
+    raise RuntimeError("Required arrays not found in CellData or PointData.")
+
+ids = numpy_support.vtk_to_numpy(id_array)
+group_ids = numpy_support.vtk_to_numpy(group_array)
+blanking = numpy_support.vtk_to_numpy(blanking_array)
+is_inlet = numpy_support.vtk_to_numpy(is_inlet_array)
+is_outlet = numpy_support.vtk_to_numpy(is_outlet_array)
+
+num_points = input.GetNumberOfPoints()
+
+# Convert blanking to PointData
+point_blanking = np.zeros(num_points)
+point_counts = np.zeros(num_points)
+
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    for i in range(cell.GetNumberOfPoints()):
+        pid = cell.GetPointId(i)
+        point_blanking[pid] += blanking[cell_id]
+        point_counts[pid] += 1
+
+point_counts[point_counts == 0] = 1
+point_blanking = point_blanking / point_counts
+point_blanking = (point_blanking > 0.5).astype(int)
+
+# Build connectivity map
+connectivity = {i: [] for i in range(num_points)}
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    for i in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(i)
+        p2 = cell.GetPointId(i + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# Compute NumConnections array
+num_connections = np.array([len(connectivity[i]) for i in range(num_points)])
+
+# Find inlet point (GroupId == 0)
+inlet_index = None
+for cell_id in range(input.GetNumberOfCells()):
+    if group_ids[cell_id] == 0:
+        inlet_index = input.GetCell(cell_id).GetPointId(0)
+        break
+if inlet_index is None:
+    raise RuntimeError("No inlet point found.")
+
+# Identify outlet points
+outlet_indices = [i for i in range(num_points) if len(connectivity[i]) == 1 and i != inlet_index]
+
+# BFS path finder
+def bfs_path(start, end, connectivity):
+    visited = set()
+    queue = deque([[start]])
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+        if node == end:
+            return path
+        if node not in visited:
+            visited.add(node)
+            for neighbor in connectivity[node]:
+                if neighbor not in path:
+                    new_path = list(path)
+                    new_path.append(neighbor)
+                    queue.append(new_path)
+    return []
+
+# Initialize global cap array
+global_cap_array = np.zeros(num_points)
+
+# Process each path
+for outlet in outlet_indices:
+    path = bfs_path(inlet_index, outlet, connectivity)
+
+    # Cap detection based on NumConnections change
+    for j in range(1, len(path)):
+        current = path[j]
+        previous = path[j - 1]
+        if num_connections[current] != num_connections[previous]:
+            global_cap_array[previous] = 1
+
+    # Add point immediately after blanking region as cap
+    for j in range(1, len(path)):
+        prev = path[j - 1]
+        curr = path[j]
+        if point_blanking[prev] == 1 and point_blanking[curr] == 0:
+            global_cap_array[curr] = 1
+
+# Remove cap points based on updated criteria
+for idx in range(num_points):
+    if global_cap_array[idx] == 1:
+        if num_connections[idx] <= 2 or point_blanking[idx] == 1 or is_inlet[idx] == 1:
+            global_cap_array[idx] = 0
+
+# Add final combined cap array
+vtk_cap_array = numpy_support.numpy_to_vtk(global_cap_array)
+vtk_cap_array.SetName("CapPoints")
+output.GetPointData().AddArray(vtk_cap_array)
+
+print(f"Found {len(outlet_indices)} outlet paths from inlet point {inlet_index}.")

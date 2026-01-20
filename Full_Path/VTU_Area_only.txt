@@ -1,0 +1,171 @@
+
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# Get input blocks
+grouped_input = inputs[0]
+centerline = grouped_input.GetBlock(0)
+surface = grouped_input.GetBlock(1)
+
+# Get arrays
+centerline_points = numpy_support.vtk_to_numpy(centerline.GetPoints().GetData())
+filtered_radius_vtk = centerline.GetPointData().GetArray("Filtered_Radius")
+blanking_vtk = centerline.GetPointData().GetArray("Blanking")
+is_inlet_vtk = centerline.GetPointData().GetArray("IsInlet")
+is_outlet_vtk = centerline.GetPointData().GetArray("IsOutlet")
+
+if filtered_radius_vtk is None or blanking_vtk is None:
+    raise RuntimeError("Required arrays (Filtered_Radius, Blanking) not found.")
+
+filtered_radius = numpy_support.vtk_to_numpy(filtered_radius_vtk)
+blanking = numpy_support.vtk_to_numpy(blanking_vtk)
+is_inlet = numpy_support.vtk_to_numpy(is_inlet_vtk)
+is_outlet = numpy_support.vtk_to_numpy(is_outlet_vtk)
+
+num_points = centerline.GetNumberOfPoints()
+estimated_area_array = np.zeros(num_points)
+clipping_flags_array = np.zeros(num_points, dtype=np.int8)
+
+# --- Build connectivity graph ---
+connectivity = {i: [] for i in range(num_points)}
+for cell_id in range(centerline.GetNumberOfCells()):
+    cell = centerline.GetCell(cell_id)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(j)
+        p2 = cell.GetPointId(j + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# --- BFS path finder ---
+def find_path(connectivity, start, end):
+    visited = set()
+    queue = deque([[start]])
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+        if node == end:
+            return path
+        if node not in visited:
+            visited.add(node)
+            for neighbor in connectivity[node]:
+                new_path = list(path)
+                new_path.append(neighbor)
+                queue.append(new_path)
+    return []
+
+# --- Collect all valid inlet-to-outlet paths ---
+valid_path_points = set()
+inlet_indices = np.where(is_inlet == 1)[0]
+outlet_indices = np.where(is_outlet == 1)[0]
+
+for inlet in inlet_indices:
+    for outlet in outlet_indices:
+        path = find_path(connectivity, inlet, outlet)
+        valid_path_points.update(path)
+
+# --- Prepare output blocks ---
+output_blocks = vtk.vtkMultiBlockDataSet()
+output_blocks.SetNumberOfBlocks(2)
+output_blocks.SetBlock(0, centerline)
+
+clipped_collection = vtk.vtkAppendPolyData()
+
+for i in valid_path_points:
+    point = centerline_points[i]
+    radius = filtered_radius[i]
+    if radius <= 0:
+        radius = 1.0
+
+    # Estimate normal direction
+    if i > 0:
+        prev_point = centerline_points[i - 1]
+    else:
+        prev_point = centerline_points[i] - np.array([1, 0, 0])
+
+    normal = point - prev_point
+    norm = np.linalg.norm(normal)
+    if norm == 0 or np.isnan(norm):
+        continue
+    normal = normal / norm
+
+    # Slice surface
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(point)
+    plane.SetNormal(normal)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetCutFunction(plane)
+    cutter.SetInputData(surface)
+    cutter.Update()
+
+    # Apply region filter to isolate closest surface region
+    region_filter = vtk.vtkPolyDataConnectivityFilter()
+    region_filter.SetInputData(cutter.GetOutput())
+    region_filter.SetExtractionModeToClosestPointRegion()
+    region_filter.SetClosestPoint(point)
+    region_filter.Update()
+    filtered = region_filter.GetOutput()
+
+    # Compute slice radius
+    points_vtk = filtered.GetPoints()
+    slice_radius = 0.0
+    if points_vtk is not None and points_vtk.GetNumberOfPoints() > 0:
+        points_np = numpy_support.vtk_to_numpy(points_vtk.GetData())
+        distances = np.linalg.norm(points_np - point, axis=1)
+        slice_radius = np.max(distances)
+
+    # Decide whether to clip
+    use_clipping = blanking[i] != 0 or slice_radius > 1.4 * radius
+    clipping_flags_array[i] = int(use_clipping)
+    if use_clipping:
+        sphere = vtk.vtkSphere()
+        sphere.SetCenter(point)
+        sphere.SetRadius(radius)
+
+        clipper = vtk.vtkClipPolyData()
+        clipper.SetInputData(filtered)
+        clipper.SetClipFunction(sphere)
+        clipper.InsideOutOn()
+        clipper.Update()
+        clipped_slice = clipper.GetOutput()
+    else:
+        clipped_slice = filtered
+
+    # Compute area
+    triangle_filter = vtk.vtkTriangleFilter()
+    triangle_filter.SetInputData(clipped_slice)
+    triangle_filter.Update()
+
+    mass_props = vtk.vtkMassProperties()
+    mass_props.SetInputData(triangle_filter.GetOutput())
+    clipped_area = mass_props.GetSurfaceArea()
+    estimated_area_array[i] = clipped_area
+    print(f"[Point {i}] Clipped area: {clipped_area}")
+
+
+# Final pass: fix any zero area values by averaging neighbors
+for i in range(num_points):
+    if estimated_area_array[i] == 0.0:
+        neighbors = connectivity.get(i, [])
+        neighbor_values = [estimated_area_array[n] for n in neighbors if estimated_area_array[n] > 0.0]
+        if neighbor_values:
+            avg_neighbor_area = np.mean(neighbor_values)
+            estimated_area_array[i] = avg_neighbor_area
+            print(f"[Point {i}] Area was zero — replaced with average of neighbors: {avg_neighbor_area}")
+        else:
+            print(f"[Point {i}] Area was zero and no valid neighbors found — value remains 0.")
+
+
+# Attach arrays
+area_vtk_fixed = numpy_support.numpy_to_vtk(estimated_area_array)
+area_vtk_fixed.SetName("Filtered_Area")
+centerline.GetPointData().AddArray(area_vtk_fixed)
+
+clipping_flags_vtk = numpy_support.numpy_to_vtk(clipping_flags_array)
+clipping_flags_vtk.SetName("Use_Clipping_Flag")
+centerline.GetPointData().AddArray(clipping_flags_vtk)
+
+# Output
+output.ShallowCopy(centerline)

@@ -1,0 +1,27 @@
+
+from vtkmodules.util import numpy_support
+import numpy as np
+
+# Get input
+input_data = self.GetInput()
+
+# Get the Blanking array from PointData
+blanking_vtk = input_data.GetPointData().GetArray("Blanking")
+if blanking_vtk is None:
+    raise RuntimeError("Array 'Blanking' not found in PointData.")
+
+# Convert to NumPy
+blanking_np = numpy_support.vtk_to_numpy(blanking_vtk)
+
+# Set all non-zero values to 1
+normalized_blanking = np.where(blanking_np != 0, 1, 0).astype(np.int8)
+
+# Convert back to VTK array
+normalized_vtk = numpy_support.numpy_to_vtk(normalized_blanking)
+normalized_vtk.SetName("blanking")
+
+# Add to output
+input_data.GetPointData().AddArray(normalized_vtk)
+
+# Output
+output.ShallowCopy(input_data)
