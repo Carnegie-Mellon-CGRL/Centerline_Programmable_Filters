@@ -1,9 +1,9 @@
 from paraview.simple import *
 import os
 
-centerlines_path = r"C:/Users/Admin/Documents/Simvascular_Files/0077_H_PULM_H/Models/0077_Centerlines.vtp"
-results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/0077_H_PULM_H/Simulations/0077_Steady_Calc_2_copy/0077_Steady_Calc_2_copy-converted-results/all_results_01000.vtu"
-results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/0077_H_PULM_H/Simulations/0077_Steady_Calc_2_copy/0077_Steady_Calc_2_copy-converted-results/all_results_01000.vtp"
+centerlines_path = r"C:/Users/path_to_centerline_vtp"
+results_vtu_path = r"C:/Users/path_to_simulation_results_vtu"
+results_vtp_path = r"C:/Users/path_to_simulation_results_vtp"
 
 # -------------------------
 # 1) Load data sources
@@ -1095,4 +1095,5 @@ pf6.OutputDataSetType = 'vtkPolyData'
 pf6.RequestInformationScript = ''
 pf6.RequestUpdateExtentScript = ''
 pf6.PythonPath = ''
+
 pf6.UpdatePipeline()
