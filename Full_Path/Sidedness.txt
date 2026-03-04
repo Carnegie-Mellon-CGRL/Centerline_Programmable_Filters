@@ -1,0 +1,86 @@
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+
+# Get input and output
+input = self.GetInputDataObject(0, 0)
+output = self.GetOutput()
+output.DeepCopy(input)
+
+num_points = input.GetNumberOfPoints()
+
+# --- Get required array ---
+generation_vtk = input.GetPointData().GetArray("Generation")
+
+if generation_vtk is None:
+    raise RuntimeError("Missing required array: 'Generation'.")
+
+generation = numpy_support.vtk_to_numpy(generation_vtk)
+
+# --- Build connectivity graph ---
+connectivity = {i: [] for i in range(num_points)}
+
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(j)
+        p2 = cell.GetPointId(j + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# --- Identify trunk and branch seeds ---
+trunk_points = np.where(generation < 0.1)[0]
+gen1_candidates = np.where((generation > 0.9) & (generation < 1.1))[0]
+
+branch_seeds = []
+for pid in gen1_candidates:
+    for neighbor in connectivity[pid]:
+        if generation[neighbor] < 0.1:
+            branch_seeds.append(pid)
+            break
+
+if len(branch_seeds) < 2:
+    raise RuntimeError(f"Expected at least two Generation 1 branch seeds, but found {len(branch_seeds)}.")
+
+branch1, branch2 = branch_seeds[:2]
+
+# --- DFS restricted to one side ---
+def dfs_with_tag(start, tag_label, temp_tags):
+    stack = [start]
+    visited = set()
+
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if generation[current] > 0.9 and temp_tags[current] is None:
+            temp_tags[current] = tag_label
+
+        for neighbor in connectivity[current]:
+            # Do not cross trunk
+            if generation[neighbor] < 0.1:
+                continue
+            if neighbor not in visited:
+                stack.append(neighbor)
+
+# Initialize tags
+temp_tags = [None] * num_points
+
+# Tag branches
+dfs_with_tag(branch1, "Left", temp_tags)
+dfs_with_tag(branch2, "Right", temp_tags)
+
+# --- Create sidedness array ---
+sidedness_vtk = vtk.vtkStringArray()
+sidedness_vtk.SetName("Sidedness")
+sidedness_vtk.SetNumberOfValues(num_points)
+
+for i in range(num_points):
+    if temp_tags[i] is None:
+        sidedness_vtk.SetValue(i, "null")
+    else:
+        sidedness_vtk.SetValue(i, temp_tags[i])
+
+output.GetPointData().AddArray(sidedness_vtk)

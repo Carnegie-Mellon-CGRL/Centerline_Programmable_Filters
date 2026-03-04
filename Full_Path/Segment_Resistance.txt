@@ -1,0 +1,293 @@
+import vtk
+import math
+
+# --------------------------------
+# Configuration
+# --------------------------------
+# Radius source array (on centerline point-data)
+RADIUS_ARRAY_NAME       = "Slice_Average_Radius"      # primary choice
+RADIUS_FALLBACK_NAME    = "Filtered_Radius" # optional fallback if primary missing
+
+POINT_SPACING_CM        = 0.01   # cm per point step (as requested)
+BLOOD_VISCOSITY         = 0.04   # Poise (≈ 4 cP)
+MIN_RADIUS_EPS          = 1e-6   # cm, clamp tiny radii to avoid blow-ups
+FLOW_EPS                = 1e-12  # to avoid division by zero in ΔP/mean(Flow)
+
+VERBOSE = False
+def log(msg):
+    if VERBOSE:
+        print(msg)
+
+# --------------------------------
+# Connectivity and segment utilities (no NumPy)
+# --------------------------------
+def build_connectivity(polydata):
+    """Undirected adjacency (point id -> neighbor ids) from polyline cells."""
+    npts = polydata.GetNumberOfPoints()
+    conn = [[] for _ in range(npts)]
+    for cid in range(polydata.GetNumberOfCells()):
+        cell = polydata.GetCell(cid)
+        m = cell.GetNumberOfPoints()
+        for j in range(m - 1):
+            a = cell.GetPointId(j)
+            b = cell.GetPointId(j + 1)
+            if b not in conn[a]:
+                conn[a].append(b)
+            if a not in conn[b]:
+                conn[b].append(a)
+    return conn
+
+def compute_degrees(connectivity):
+    return [len(nbs) for nbs in connectivity]
+
+def find_segments(centerline, connectivity):
+    """
+    Segment = maximal path between nodes with degree != 2; interior nodes have degree == 2.
+    Returns: list of segments, each a list of point IDs (including endpoints).
+    """
+    n = centerline.GetNumberOfPoints()
+    deg = compute_degrees(connectivity)
+    junctions = [i for i in range(n) if deg[i] != 2]
+
+    visited_edge = set()  # undirected edges as (min(a,b), max(a,b))
+    segments = []
+
+    def mark_edge(a, b):
+        visited_edge.add((a, b) if a < b else (b, a))
+
+    def edge_seen(a, b):
+        return ((a, b) if a < b else (b, a)) in visited_edge
+
+    # Walk outward from each junction along each neighbor, stopping at the next junction.
+    for j in junctions:
+        for nb in connectivity[j]:
+            if edge_seen(j, nb):
+                continue
+
+            seg = [j]
+            prev = j
+            curr = nb
+            mark_edge(prev, curr)
+
+            while True:
+                seg.append(curr)
+                if deg[curr] != 2:
+                    break
+                nbs = connectivity[curr]
+                nxt = nbs[0] if nbs[1] == prev else nbs[1]
+                if edge_seen(curr, nxt):
+                    break
+                prev, curr = curr, nxt
+                mark_edge(prev, curr)
+
+            segments.append(seg)
+
+    # Optional: detect/handle pure loops with all degree==2.
+
+    return segments
+
+def lower_quartile_mean(values):
+    """
+    Average of the lowest 25% of the given values.
+    Pure Python: sort ascending, take first ceil(0.25*N), average them.
+    If values is empty, return 0.0.
+    """
+    n = len(values)
+    if n == 0:
+        return 0.0
+    vals = list(values)
+    vals.sort()
+    k = int(math.ceil(0.25 * n))
+    if k < 1:
+        k = 1
+    s = 0.0
+    for i in range(k):
+        s += vals[i]
+    return s / float(k)
+
+# --------------------------------
+# Inputs
+# --------------------------------
+# Accept either a PolyData directly, or a MultiBlock with centerline in block 0
+input0 = self.GetInputDataObject(0, 0)
+if input0 is None:
+    raise RuntimeError("No input on port 0.")
+
+# If the input is a multiblock, grab block 0 as centerline.
+if isinstance(input0, vtk.vtkMultiBlockDataSet):
+    centerline = input0.GetBlock(0)
+else:
+    centerline = input0
+
+if centerline is None or centerline.GetPoints() is None:
+    raise RuntimeError("Centerline is missing or has no points.")
+
+num_points = centerline.GetNumberOfPoints()
+log(f"[Info] Centerline points: {num_points}")
+
+# Arrays
+pd = centerline.GetPointData()
+
+# Radii
+radius_arr = pd.GetArray(RADIUS_ARRAY_NAME)
+if radius_arr is None and RADIUS_FALLBACK_NAME:
+    radius_arr = pd.GetArray(RADIUS_FALLBACK_NAME)
+if radius_arr is None:
+    raise RuntimeError(
+        f"Neither '{RADIUS_ARRAY_NAME}' nor '{RADIUS_FALLBACK_NAME}' was found on centerline point-data."
+    )
+
+# WSS (Filtered_AverageWSS)
+wss_arr = pd.GetArray("Filtered_AverageWSS")
+if wss_arr is None:
+    log("[Warn] 'Filtered_AverageWSS' array not found. Segment_Avg_Filtered_AverageWSS will be 0.0.")
+
+# ΔP/mean(Flow)
+pressure_arr = pd.GetArray("pressure")  # case-sensitive
+flow_arr     = pd.GetArray("Flow")      # case-sensitive
+if pressure_arr is None or flow_arr is None:
+    log("[Warn] 'pressure' and/or 'Flow' array not found. Segment_Ohm's_Resistance will be 0.")
+
+# --------------------------------
+# Build segments
+# --------------------------------
+connectivity = build_connectivity(centerline)
+segments = find_segments(centerline, connectivity)
+log(f"[Info] Found {len(segments)} segments")
+
+# --------------------------------
+# Prepare output arrays (per-point, segment-wise constant values)
+# --------------------------------
+seg_id_arr = vtk.vtkIntArray()
+seg_id_arr.SetName("Segment_ID")
+seg_id_arr.SetNumberOfComponents(1)
+seg_id_arr.SetNumberOfTuples(num_points)
+seg_id_arr.FillComponent(0, -1)
+
+seg_lq25_r_arr = vtk.vtkDoubleArray()
+seg_lq25_r_arr.SetName("Segment_LQ25_AvgRadius")
+seg_lq25_r_arr.SetNumberOfComponents(1)
+seg_lq25_r_arr.SetNumberOfTuples(num_points)
+seg_lq25_r_arr.FillComponent(0, 0.0)
+
+seg_len_arr = vtk.vtkDoubleArray()
+seg_len_arr.SetName("Segment_Length_cm")
+seg_len_arr.SetNumberOfComponents(1)
+seg_len_arr.SetNumberOfTuples(num_points)
+seg_len_arr.FillComponent(0, 0.0)
+
+seg_res_poiseuille_arr = vtk.vtkDoubleArray()
+seg_res_poiseuille_arr.SetName("Segment_Poiseuille_Resistance")
+seg_res_poiseuille_arr.SetNumberOfComponents(1)
+seg_res_poiseuille_arr.SetNumberOfTuples(num_points)
+seg_res_poiseuille_arr.FillComponent(0, 0.0)
+
+seg_res_datadriven_arr = vtk.vtkDoubleArray()
+seg_res_datadriven_arr.SetName("Segment_Ohm's_Resistance")  # ΔP / mean(Flow)
+seg_res_datadriven_arr.SetNumberOfComponents(1)
+seg_res_datadriven_arr.SetNumberOfTuples(num_points)
+seg_res_datadriven_arr.FillComponent(0, 0.0)
+
+seg_wss_mean_arr = vtk.vtkDoubleArray()
+seg_wss_mean_arr.SetName("Segment_Avg_Filtered_AverageWSS")
+seg_wss_mean_arr.SetNumberOfComponents(1)
+seg_wss_mean_arr.SetNumberOfTuples(num_points)
+seg_wss_mean_arr.FillComponent(0, 0.0)
+
+# --------------------------------
+# Compute per-segment values and paint them on all points in the segment
+# --------------------------------
+for seg_idx, seg in enumerate(segments):
+    # Collect (radius, pid) pairs for finite radii
+    rpairs = []
+    for pid in seg:
+        r = float(radius_arr.GetTuple1(pid))
+        if math.isfinite(r):
+            rpairs.append((r, pid))
+
+    # If no finite radii, everything will fall back via MIN_RADIUS_EPS later
+    n_fin = len(rpairs)
+
+    # Sort ascending by radius
+    rpairs.sort(key=lambda t: t[0])
+
+    # Determine how many are in the lowest quartile
+    if n_fin > 0:
+        k = int(math.ceil(0.25 * n_fin))
+        if k < 1:
+            k = 1
+    else:
+        k = 0
+
+    # Extract the lowest-quartile subset for radius values and their PIDs
+    lowest_r_vals = []
+    lowest_r_pids = []
+    for i in range(k):
+        lowest_r_vals.append(rpairs[i][0])
+        lowest_r_pids.append(rpairs[i][1])
+
+    # 2) Lower-quartile average radius (mean of lowest_r_vals)
+    if k > 0:
+        lq25_avg_r = sum(lowest_r_vals) / float(k)
+    else:
+        lq25_avg_r = 0.0
+
+    # 6) Segment mean of Filtered_AverageWSS across the SAME lowest-quartile radius points
+    if wss_arr is not None and k > 0:
+        w_sum = 0.0
+        w_cnt = 0
+        for pid in lowest_r_pids:
+            w = float(wss_arr.GetTuple1(pid))
+            if math.isfinite(w):
+                w_sum += w
+                w_cnt += 1
+        wss_mean = (w_sum / float(w_cnt)) if w_cnt > 0 else 0.0
+    else:
+        wss_mean = 0.0
+        # Optional: set VERBOSE=True above to see warnings
+        # log(f"[Warn] seg {seg_idx}: no WSS available on LQ25 radius subset; WSS mean set to 0.")
+
+    # 3) Segment length (as requested: number_of_points * spacing)
+    seg_length_cm = float(len(seg)) * float(POINT_SPACING_CM)
+
+    # 4) Poiseuille resistance with clamped radius
+    r_safe = lq25_avg_r if lq25_avg_r > MIN_RADIUS_EPS else MIN_RADIUS_EPS
+    R_poiseuille = (8.0 * BLOOD_VISCOSITY * seg_length_cm) / (math.pi * (r_safe ** 4))
+
+    # 5) Data-driven resistance ΔP / mean(Flow)
+    R_data = 0.0
+    if (pressure_arr is not None) and (flow_arr is not None) and (len(seg) >= 1):
+        p_start = float(pressure_arr.GetTuple1(seg[0]))
+        p_end   = float(pressure_arr.GetTuple1(seg[-1]))
+        q_sum = 0.0
+        q_cnt = 0
+        for pid in seg:
+            q = float(flow_arr.GetTuple1(pid))
+            if math.isfinite(q):
+                q_sum += q
+                q_cnt += 1
+        q_mean = (q_sum / float(q_cnt)) if q_cnt > 0 else 0.0
+        if abs(q_mean) > FLOW_EPS and math.isfinite(p_start) and math.isfinite(p_end):
+            R_data = (p_start - p_end) / q_mean
+        else:
+            R_data = 0.0
+
+    # 7) Paint values to all points in the segment
+    for pid in seg:
+        seg_id_arr.SetTuple1(pid, int(seg_idx))
+        seg_lq25_r_arr.SetTuple1(pid, float(lq25_avg_r))
+        seg_len_arr.SetTuple1(pid, float(seg_length_cm))
+        seg_res_poiseuille_arr.SetTuple1(pid, float(R_poiseuille))
+        seg_res_datadriven_arr.SetTuple1(pid, float(R_data))
+        seg_wss_mean_arr.SetTuple1(pid, float(wss_mean))
+# --------------------------------
+# Attach arrays & output
+# --------------------------------
+pd.AddArray(seg_id_arr)
+pd.AddArray(seg_lq25_r_arr)
+pd.AddArray(seg_len_arr)
+pd.AddArray(seg_res_poiseuille_arr)
+pd.AddArray(seg_res_datadriven_arr)
+pd.AddArray(seg_wss_mean_arr)
+
+output.ShallowCopy(centerline)

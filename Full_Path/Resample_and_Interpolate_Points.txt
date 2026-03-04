@@ -3,7 +3,7 @@ import vtk
 from collections import deque
 
 # Parameters
-target_spacing = 0.01  # mm
+target_spacing = 0.01  # cm
 
 # Input
 input_data = self.GetInput()

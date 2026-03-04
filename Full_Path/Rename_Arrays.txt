@@ -1,0 +1,55 @@
+
+from vtkmodules.util import numpy_support
+
+# Get input
+input_data = self.GetInput()
+
+# Define array name mappings: {"old_name": "new_name"}
+rename_map = {
+"RegionId": "regionId",
+"AverageWSS": "averageWSS",
+"Blanking": "blanking",
+"CapPoints": "capPoints",
+"CenterlineIds": "centerlineIds",
+"CrossSectionalArea": "crossSectionalArea",
+"EdgeArray": "edgeArray",
+"EdgePCoordArray": "edgePCoordArray",
+"GlobalElementID": "globalElementID",
+"GlobalNodeID": "globalNodeID",
+"GroupIds": "groupIds",
+"MaximumInscribedSphereRadius": "sphereRadius",
+"TractIds": "tractIds",
+"PathOrder": "pathOrder",
+"Slice_Normal": "slice_Normal",
+"Segment_ID": "segment_ID",
+"Segment_LQ25_AvgRadius": "segment_avgradius",
+"Segment_Data_Resistance": "z-resistance_segment_information",
+"Use_Clipping_Flag": "z-clipping_Flag",
+"Segment_LQ25_AvgRadius": "segment_LowerQuartile_AvgRadius",
+"Segment_LQ25_AvgRadius_Initial": "z-initial_avgRadius",
+"Segment_Radius_Fix_Code": "z-fix_segment_radius",
+"Segment_ID": "segment_ID",
+"OnAnyPathFlag": "onAnyPathFlag",
+"BranchOutletId" : "z-extra_Outlet_ID",
+"Power": "power_byPressuresValuePerPoint"
+}
+
+# Loop through each mapping
+for old_name, new_name in rename_map.items():
+    old_array = input_data.GetPointData().GetArray(old_name)
+    if old_array is None:
+        print(f"⚠️ Array '{old_name}' not found in PointData. Skipping.")
+        continue
+
+    # Convert to NumPy and back to VTK with new name
+    array_np = numpy_support.vtk_to_numpy(old_array)
+    new_array_vtk = numpy_support.numpy_to_vtk(array_np)
+    new_array_vtk.SetName(new_name)
+
+    # Add new array and remove old one
+    input_data.GetPointData().AddArray(new_array_vtk)
+    input_data.GetPointData().RemoveArray(old_name)
+    print(f"✅ Renamed '{old_name}' to '{new_name}'.")
+
+# Output
+output.ShallowCopy(input_data)

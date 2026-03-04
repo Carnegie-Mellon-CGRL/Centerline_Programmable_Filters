@@ -1,0 +1,128 @@
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+
+# Get input and output
+input = self.GetInputDataObject(0, 0)
+output = self.GetOutput()
+output.DeepCopy(input)
+
+num_points = input.GetNumberOfPoints()
+
+# --- Get required arrays ---
+velocity_vtk = input.GetPointData().GetArray("velocity")
+area_vtk = input.GetPointData().GetArray("Filtered_Area")
+pressure_vtk = input.GetPointData().GetArray("Pressure (mmHg)")
+generation_vtk = input.GetPointData().GetArray("Generation")
+
+if velocity_vtk is None or area_vtk is None or pressure_vtk is None or generation_vtk is None:
+    raise RuntimeError("Missing required arrays: 'velocity', 'Filtered_Area', 'Pressure (mmHg)', or 'Generation'.")
+
+velocity_np = numpy_support.vtk_to_numpy(velocity_vtk)
+area_np = numpy_support.vtk_to_numpy(area_vtk)
+pressure_np = numpy_support.vtk_to_numpy(pressure_vtk)
+generation = numpy_support.vtk_to_numpy(generation_vtk)
+
+# --- Compute Flow ---
+velocity_magnitude = np.linalg.norm(velocity_np, axis=1)
+flow_array = velocity_magnitude * area_np
+
+# --- Compute Power ---
+power_array = np.zeros_like(flow_array)
+nonzero_flow = flow_array > 1e-8
+power_array[nonzero_flow] = pressure_np[nonzero_flow] * flow_array[nonzero_flow]
+
+# --- Build connectivity graph ---
+connectivity = {i: [] for i in range(num_points)}
+for cell_id in range(input.GetNumberOfCells()):
+    cell = input.GetCell(cell_id)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p1 = cell.GetPointId(j)
+        p2 = cell.GetPointId(j + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+
+# --- Identify trunk and branch seeds ---
+trunk_points = np.where(generation < 0.1)[0]
+gen1_candidates = np.where((generation > 0.9) & (generation < 1.1))[0]
+
+branch_seeds = []
+for pid in gen1_candidates:
+    for neighbor in connectivity[pid]:
+        if generation[neighbor] < 0.1:
+            branch_seeds.append(pid)
+            break
+
+if len(branch_seeds) < 2:
+    raise RuntimeError(f"Expected at least two Generation 1 branch seeds, but found {len(branch_seeds)}.")
+
+branch1, branch2 = branch_seeds[:2]
+
+
+
+# --- DFS restricted to one side and debugging ---
+def dfs_with_tag(start, connectivity, visited, temp_tags, current_tag):
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        # Debug: Check if tagging with B
+        if current_tag == "B" and temp_tags[current] is None:
+            print(f"Tagging point {current} with B")
+
+        # Debug: Check if switching from B to A
+        if temp_tags[current] == "B" and current_tag == "A":
+            print(f"Switching point {current} from B to A")
+
+        # Assign tag if generation > 0.9 and no tag yet
+        if generation[current] > 0.9 and temp_tags[current] is None:
+            temp_tags[current] = current_tag
+
+        for neighbor in connectivity[current]:
+            # Restrict DFS: do not cross trunk (generation < 0.1)
+            if generation[neighbor] < 0.1:
+                continue
+            if neighbor not in visited:
+                stack.append(neighbor)
+
+# Initialize tags
+temp_tags = [None] * num_points
+visited = set()
+
+# Tag branches
+dfs_with_tag(branch1, connectivity, visited, temp_tags, "A")
+dfs_with_tag(branch2, connectivity, visited, temp_tags, "B")
+
+# Convert tags to numeric sidedness
+sidedness_labels = ["null"] * num_points
+
+for i, tag in enumerate(temp_tags):
+    if tag == "A":
+        sidedness_labels[i] = "Left"
+    elif tag == "B":
+        sidedness_labels[i] = "Right"
+
+# Debug summary
+print(f"Total A tags: {temp_tags.count('A')}, Total B tags: {temp_tags.count('B')}")
+
+# --- Add arrays to output ---
+flow_vtk = numpy_support.numpy_to_vtk(flow_array)
+flow_vtk.SetName("Flow")
+output.GetPointData().AddArray(flow_vtk)
+
+power_vtk = numpy_support.numpy_to_vtk(power_array)
+power_vtk.SetName("Power")
+output.GetPointData().AddArray(power_vtk)
+
+
+# Add string array to output
+sidedness_vtk = vtk.vtkStringArray()
+sidedness_vtk.SetName("Sidedness")
+sidedness_vtk.SetNumberOfValues(num_points)
+for i in range(num_points):
+    sidedness_vtk.SetValue(i, sidedness_labels[i])
+output.GetPointData().AddArray(sidedness_vtk)
+
