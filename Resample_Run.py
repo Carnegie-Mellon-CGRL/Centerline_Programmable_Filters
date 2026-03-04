@@ -1,9 +1,9 @@
 from paraview.simple import *
 import os
 
-centerlines_path = r"C:/Users/Admin/Documents/temp/RM92877_Finer.vtp"
-results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/RM92877/Simulations/RM92877_BL_Calc_Finer/RM92877_BL_Calc_Finer-converted-results/all_results_01000.vtu"
-results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/RM92877/Simulations/RM92877_BL_Calc_Finer/RM92877_BL_Calc_Finer-converted-results/all_results_01000.vtp"
+centerlines_path = r"C:/Users/Admin/Documents/temp-2/JL22572.vtp"
+results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/JL_Branch_Testing/Simulations/JL22572_BL_Calc_3/JL22572_BL_Calc_3-converted-results/all_results_01000.vtu"
+results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/JL_Branch_Testing/Simulations/JL22572_BL_Calc_3/JL22572_BL_Calc_3-converted-results/all_results_01000.vtp"
 
 # -------------------------
 # 1) Load data sources
@@ -190,7 +190,7 @@ pf1.UpdatePipeline()
 clean_pf1 = Clean(Input=pf1)
 
 # Merge points within this distance
-clean_pf1.Tolerance = 0.00011
+clean_pf1.Tolerance = 0.0
 
 # Recommended defaults (shown for clarity)
 clean_pf1.ConvertLinesToPoints = 0   # leave topology intact
@@ -518,24 +518,24 @@ if (filtered_area_vtk is None or blanking_vtk is None or
 # -------------------------------------------------------------------------
 # Convert to NumPy
 # -------------------------------------------------------------------------
-points_np = numpy_support.vtk_to_numpy(poly.GetPoints().GetData())
+points_np     = numpy_support.vtk_to_numpy(poly.GetPoints().GetData())
 filtered_area = numpy_support.vtk_to_numpy(filtered_area_vtk)
-blanking = numpy_support.vtk_to_numpy(blanking_vtk)
-is_inlet = numpy_support.vtk_to_numpy(is_inlet_vtk)
-is_outlet = numpy_support.vtk_to_numpy(is_outlet_vtk)
-velocity_np = numpy_support.vtk_to_numpy(velocity_vtk)
-pressure_np = numpy_support.vtk_to_numpy(pressure_vtk)
+blanking      = numpy_support.vtk_to_numpy(blanking_vtk)
+is_inlet      = numpy_support.vtk_to_numpy(is_inlet_vtk)
+is_outlet     = numpy_support.vtk_to_numpy(is_outlet_vtk)
+velocity_np   = numpy_support.vtk_to_numpy(velocity_vtk)
+pressure_np   = numpy_support.vtk_to_numpy(pressure_vtk)
 
 # -------------------------------------------------------------------------
 # Allocate Output Arrays
 # -------------------------------------------------------------------------
-flow_array = np.zeros(num_points)
-power_array = np.zeros(num_points)
+flow_array       = np.zeros(num_points)
+power_array      = np.zeros(num_points)
 resistance_array = np.zeros(num_points)
-normals_array = np.zeros((num_points, 3))
+normals_array    = np.zeros((num_points, 3))
 
 # -------------------------------------------------------------------------
-# Build Connectivity Graph (once)
+# Build Connectivity Graph
 # -------------------------------------------------------------------------
 connectivity = {i: [] for i in range(num_points)}
 
@@ -572,7 +572,7 @@ def find_path(connectivity, start, end):
 # Identify Valid Path Points
 # -------------------------------------------------------------------------
 valid_path_points = set()
-inlet_indices = np.where(is_inlet == 1)[0]
+inlet_indices  = np.where(is_inlet == 1)[0]
 outlet_indices = np.where(is_outlet == 1)[0]
 
 for inlet in inlet_indices:
@@ -581,10 +581,11 @@ for inlet in inlet_indices:
         valid_path_points.update(path)
 
 # -------------------------------------------------------------------------
-# Compute Flow (DOT PRODUCT), Power, Resistance
+# Compute Flow, Power, Resistance
 # -------------------------------------------------------------------------
 for i in valid_path_points:
-    # Estimate local tangent / normal
+
+    # Estimate normal
     if i > 0:
         prev_point = points_np[i - 1]
     else:
@@ -592,23 +593,21 @@ for i in valid_path_points:
 
     tangent = points_np[i] - prev_point
     norm = np.linalg.norm(tangent)
-
     if norm == 0.0 or np.isnan(norm):
         continue
 
     normal = tangent / norm
     normals_array[i] = normal
 
-    # Dot-product directional velocity
+    # Dot velocity with normal
     v_vec = velocity_np[i]
     v_normal = np.dot(v_vec, normal)
 
-    area = filtered_area[i]
-    if area <= 0.0:
+    A = filtered_area[i]
+    if A <= 0.0:
         continue
 
-    # FLOW = (v · n) * A   <-- REQUIRED
-    flow = abs(v_normal * area)   # To account for wrong directionality
+    flow = abs(v_normal * A)
     flow_array[i] = flow
 
     if abs(flow) > 1e-8:
@@ -616,7 +615,52 @@ for i in valid_path_points:
         resistance_array[i] = pressure_np[i] / flow
 
 # -------------------------------------------------------------------------
-# Attach New Arrays (preserve all existing data)
+# >>> SAFETY FIX: FLOW JUMP STABILIZATION <<<
+# -------------------------------------------------------------------------
+
+FLOW_JUMP_FACTOR = 10.0  # max allowed ratio between neighbors
+
+fixed_flow = flow_array.copy()
+
+for i in valid_path_points:
+
+    neighbors = connectivity[i]
+    neigh_flows = [flow_array[n] for n in neighbors if n in valid_path_points]
+
+    if len(neigh_flows) == 0:
+        continue
+
+    fi = flow_array[i]
+
+    # If any zero neighbors, handle separately
+    if fi <= 0 or min(neigh_flows) <= 0:
+        nz = [f for f in neigh_flows if f > 0]
+        if len(nz) > 0:
+            fixed_flow[i] = sum(nz) / len(nz)
+        continue
+
+    # Compute ratio
+    ratio = max( [fi] + neigh_flows ) / min( [fi] + neigh_flows )
+
+    if ratio > FLOW_JUMP_FACTOR:
+        # Physiologically impossible → smooth
+        fixed_flow[i] = float(sum(neigh_flows) / len(neigh_flows))
+
+# Replace with smoothed version
+flow_array = fixed_flow
+
+# Recompute power and resistance using smoothed flow
+for i in valid_path_points:
+    f = flow_array[i]
+    if abs(f) > 1e-8:
+        power_array[i]      = pressure_np[i] * f
+        resistance_array[i] = pressure_np[i] / f
+    else:
+        power_array[i]      = 0.0
+        resistance_array[i] = 0.0
+
+# -------------------------------------------------------------------------
+# Attach Arrays
 # -------------------------------------------------------------------------
 def add_array(name, np_array, num_comps=1):
     vtk_arr = numpy_support.numpy_to_vtk(np_array, deep=1)
@@ -628,7 +672,6 @@ add_array("Flow", flow_array)
 add_array("Power", power_array)
 add_array("Ohm's Law Resistance", resistance_array)
 add_array("Slice_Normal", normals_array, 3)
-
 """
 pf5.RequestInformationScript = ''
 pf5.RequestUpdateExtentScript = ''
@@ -1000,7 +1043,6 @@ pf6.UpdatePipeline()
 # -------------------------
 pf7 = ProgrammableFilter(Input=[pf6])
 pf7.Script = r"""
-
 import vtk
 import math
 
@@ -1008,8 +1050,8 @@ import math
 # Configuration
 # --------------------------------
 # Radius source array (on centerline point-data)
-RADIUS_ARRAY_NAME       = "Filtered_Radius"      # primary choice
-RADIUS_FALLBACK_NAME    = "Slice_Average_Radius" # optional fallback if primary missing
+RADIUS_ARRAY_NAME       = "Slice_Average_Radius"      # primary choice
+RADIUS_FALLBACK_NAME    = "Filtered_Radius" # optional fallback if primary missing
 
 POINT_SPACING_CM        = 0.01   # cm per point step (as requested)
 BLOOD_VISCOSITY         = 0.04   # Poise (≈ 4 cP)
@@ -1025,7 +1067,7 @@ def log(msg):
 # Connectivity and segment utilities (no NumPy)
 # --------------------------------
 def build_connectivity(polydata):
-    # Undirected adjacency (point id -> neighbor ids) from polyline cells.
+     # Undirected adjacency (point id -> neighbor ids) from polyline cells. 
     npts = polydata.GetNumberOfPoints()
     conn = [[] for _ in range(npts)]
     for cid in range(polydata.GetNumberOfCells()):
@@ -1044,10 +1086,10 @@ def compute_degrees(connectivity):
     return [len(nbs) for nbs in connectivity]
 
 def find_segments(centerline, connectivity):
-    
+  
     # Segment = maximal path between nodes with degree != 2; interior nodes have degree == 2.
     # Returns: list of segments, each a list of point IDs (including endpoints).
-    
+     
     n = centerline.GetNumberOfPoints()
     deg = compute_degrees(connectivity)
     junctions = [i for i in range(n) if deg[i] != 2]
@@ -1085,22 +1127,20 @@ def find_segments(centerline, connectivity):
 
             segments.append(seg)
 
-    # Optional: handle pure loops with all degree==2 (rare for centerlines).
-    # If needed, add an extra pass for remaining unvisited edges among degree-2 nodes.
+    # Optional: detect/handle pure loops with all degree==2.
 
     return segments
 
 def lower_quartile_mean(values):
-
-    # Average of the lowest 25% of the given values.
-    # Pure Python: sort ascending, take first ceil(0.25*N), average them.
-    # If values is empty, return 0.0.
     
+    #Average of the lowest 25% of the given values.
+    #Pure Python: sort ascending, take first ceil(0.25*N), average them.
+    #If values is empty, return 0.0.
+     
     n = len(values)
     if n == 0:
         return 0.0
     vals = list(values)
-    # insertion sort would suffice; Python sort is fine here
     vals.sort()
     k = int(math.ceil(0.25 * n))
     if k < 1:
@@ -1130,23 +1170,28 @@ if centerline is None or centerline.GetPoints() is None:
 num_points = centerline.GetNumberOfPoints()
 log(f"[Info] Centerline points: {num_points}")
 
-# Radius array
+# Arrays
 pd = centerline.GetPointData()
+
+# Radii
 radius_arr = pd.GetArray(RADIUS_ARRAY_NAME)
 if radius_arr is None and RADIUS_FALLBACK_NAME:
     radius_arr = pd.GetArray(RADIUS_FALLBACK_NAME)
-
 if radius_arr is None:
     raise RuntimeError(
         f"Neither '{RADIUS_ARRAY_NAME}' nor '{RADIUS_FALLBACK_NAME}' was found on centerline point-data."
     )
 
-# Data arrays for ΔP/mean(Flow) resistance
+# WSS (Filtered_AverageWSS)
+wss_arr = pd.GetArray("Filtered_AverageWSS")
+if wss_arr is None:
+    log("[Warn] 'Filtered_AverageWSS' array not found. Segment_Avg_Filtered_AverageWSS will be 0.0.")
+
+# ΔP/mean(Flow)
 pressure_arr = pd.GetArray("pressure")  # case-sensitive
 flow_arr     = pd.GetArray("Flow")      # case-sensitive
-
 if pressure_arr is None or flow_arr is None:
-    log("[Warn] 'pressure' and/or 'Flow' array not found. Segment_Data_Resistance will be zero.")
+    log("[Warn] 'pressure' and/or 'Flow' array not found. Segment_Ohm's_Resistance will be 0.")
 
 # --------------------------------
 # Build segments
@@ -1188,19 +1233,64 @@ seg_res_datadriven_arr.SetNumberOfComponents(1)
 seg_res_datadriven_arr.SetNumberOfTuples(num_points)
 seg_res_datadriven_arr.FillComponent(0, 0.0)
 
+seg_wss_mean_arr = vtk.vtkDoubleArray()
+seg_wss_mean_arr.SetName("Segment_Avg_Filtered_AverageWSS")
+seg_wss_mean_arr.SetNumberOfComponents(1)
+seg_wss_mean_arr.SetNumberOfTuples(num_points)
+seg_wss_mean_arr.FillComponent(0, 0.0)
+
 # --------------------------------
 # Compute per-segment values and paint them on all points in the segment
 # --------------------------------
 for seg_idx, seg in enumerate(segments):
-    # 1) Collect radii on this segment (finite values)
-    rs = []
+    # Collect (radius, pid) pairs for finite radii
+    rpairs = []
     for pid in seg:
         r = float(radius_arr.GetTuple1(pid))
         if math.isfinite(r):
-            rs.append(r)
+            rpairs.append((r, pid))
 
-    # 2) Lower-quartile average radius
-    lq25_avg_r = lower_quartile_mean(rs)
+    # If no finite radii, everything will fall back via MIN_RADIUS_EPS later
+    n_fin = len(rpairs)
+
+    # Sort ascending by radius
+    rpairs.sort(key=lambda t: t[0])
+
+    # Determine how many are in the lowest quartile
+    if n_fin > 0:
+        k = int(math.ceil(0.25 * n_fin))
+        if k < 1:
+            k = 1
+    else:
+        k = 0
+
+    # Extract the lowest-quartile subset for radius values and their PIDs
+    lowest_r_vals = []
+    lowest_r_pids = []
+    for i in range(k):
+        lowest_r_vals.append(rpairs[i][0])
+        lowest_r_pids.append(rpairs[i][1])
+
+    # 2) Lower-quartile average radius (mean of lowest_r_vals)
+    if k > 0:
+        lq25_avg_r = sum(lowest_r_vals) / float(k)
+    else:
+        lq25_avg_r = 0.0
+
+    # 6) Segment mean of Filtered_AverageWSS across the SAME lowest-quartile radius points
+    if wss_arr is not None and k > 0:
+        w_sum = 0.0
+        w_cnt = 0
+        for pid in lowest_r_pids:
+            w = float(wss_arr.GetTuple1(pid))
+            if math.isfinite(w):
+                w_sum += w
+                w_cnt += 1
+        wss_mean = (w_sum / float(w_cnt)) if w_cnt > 0 else 0.0
+    else:
+        wss_mean = 0.0
+        # Optional: set VERBOSE=True above to see warnings
+        # log(f"[Warn] seg {seg_idx}: no WSS available on LQ25 radius subset; WSS mean set to 0.")
 
     # 3) Segment length (as requested: number_of_points * spacing)
     seg_length_cm = float(len(seg)) * float(POINT_SPACING_CM)
@@ -1212,11 +1302,8 @@ for seg_idx, seg in enumerate(segments):
     # 5) Data-driven resistance ΔP / mean(Flow)
     R_data = 0.0
     if (pressure_arr is not None) and (flow_arr is not None) and (len(seg) >= 1):
-        # Define "start" as the first point in the segment list, "end" as the last
         p_start = float(pressure_arr.GetTuple1(seg[0]))
         p_end   = float(pressure_arr.GetTuple1(seg[-1]))
-
-        # Mean flow over the segment (finite values)
         q_sum = 0.0
         q_cnt = 0
         for pid in seg:
@@ -1225,19 +1312,19 @@ for seg_idx, seg in enumerate(segments):
                 q_sum += q
                 q_cnt += 1
         q_mean = (q_sum / float(q_cnt)) if q_cnt > 0 else 0.0
-
         if abs(q_mean) > FLOW_EPS and math.isfinite(p_start) and math.isfinite(p_end):
             R_data = (p_start - p_end) / q_mean
         else:
-            R_data = 0.0  # leave 0 if no valid flow or pressures
+            R_data = 0.0
 
-    # 6) Paint values to all points in the segment
+    # 7) Paint values to all points in the segment
     for pid in seg:
         seg_id_arr.SetTuple1(pid, int(seg_idx))
         seg_lq25_r_arr.SetTuple1(pid, float(lq25_avg_r))
         seg_len_arr.SetTuple1(pid, float(seg_length_cm))
         seg_res_poiseuille_arr.SetTuple1(pid, float(R_poiseuille))
         seg_res_datadriven_arr.SetTuple1(pid, float(R_data))
+        seg_wss_mean_arr.SetTuple1(pid, float(wss_mean))
 
 # --------------------------------
 # Attach arrays & output
@@ -1247,6 +1334,7 @@ pd.AddArray(seg_lq25_r_arr)
 pd.AddArray(seg_len_arr)
 pd.AddArray(seg_res_poiseuille_arr)
 pd.AddArray(seg_res_datadriven_arr)
+pd.AddArray(seg_wss_mean_arr)
 
 output.ShallowCopy(centerline)
 
@@ -1365,7 +1453,6 @@ pf8.UpdatePipeline()
 pf9 = ProgrammableFilter(Input=[pf8])
 pf9.Script = r"""
 
-
 from vtkmodules.util import numpy_support
 
 # Get input
@@ -1389,7 +1476,16 @@ rename_map = {
 "PathOrder": "pathOrder",
 "Slice_Normal": "slice_Normal",
 "Segment_ID": "segment_ID",
-"Segment_LQ25_AvgRadius": "segment_avgradius"
+"Segment_LQ25_AvgRadius": "segment_avgradius",
+"Segment_Data_Resistance": "z-resistance_segment_information",
+"Use_Clipping_Flag": "z-clipping_Flag",
+"Segment_LQ25_AvgRadius": "segment_LowerQuartile_AvgRadius",
+"Segment_LQ25_AvgRadius_Initial": "z-initial_avgRadius",
+"Segment_Radius_Fix_Code": "z-fix_segment_radius",
+"Segment_ID": "segment_ID",
+"OnAnyPathFlag": "onAnyPathFlag",
+"BranchOutletId" : "z-extra_Outlet_ID",
+"Power" : "power_byPressureValuePerPoint"
 }
 
 # Loop through each mapping
@@ -1418,3 +1514,465 @@ pf9.RequestInformationScript = ''
 pf9.RequestUpdateExtentScript = ''
 pf9.PythonPath = ''
 pf9.UpdatePipeline()
+
+# -------------------------
+# 13) Programmable Filter 10
+# Adds additional segment-wise arrays 
+# -------------------------
+pf10 = ProgrammableFilter(Input=[pf9])
+pf10.Script = r"""
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+import math
+
+# --------------------------------
+# Inputs (PolyData or MultiBlock with PolyData in block 0)
+# --------------------------------
+inp = self.GetInputDataObject(0, 0)
+if inp is None:
+    raise RuntimeError("No input on port 0.")
+
+if isinstance(inp, vtk.vtkMultiBlockDataSet):
+    poly = inp.GetBlock(0)
+else:
+    poly = inp
+
+if poly is None or poly.GetPoints() is None:
+    raise RuntimeError("Input centerline PolyData missing or has no points.")
+
+num_points = poly.GetNumberOfPoints()
+pd = poly.GetPointData()
+
+# --------------------------------
+# Required arrays
+# --------------------------------
+seg_vtk   = pd.GetArray("segment_ID")
+r_vtk     = pd.GetArray("Slice_Average_Radius")
+pwr_vtk   = pd.GetArray("Power")
+
+if seg_vtk is None:
+    raise RuntimeError("Missing required array: 'segment_ID' (point-data).")
+if r_vtk is None:
+    raise RuntimeError("Missing required array: 'Slice_Average_Radius' (point-data).")
+if pwr_vtk is None:
+    raise RuntimeError("Missing required array: 'Power' (point-data).")
+
+# Convert to NumPy
+seg_id = numpy_support.vtk_to_numpy(seg_vtk).astype(np.int64, copy=False)
+radius = numpy_support.vtk_to_numpy(r_vtk).astype(float, copy=False)
+power  = numpy_support.vtk_to_numpy(pwr_vtk).astype(float, copy=False)
+
+# --------------------------------
+# Allocate outputs (per-point, constant within segment)
+# --------------------------------
+seg_lq25_avgpower = np.zeros(num_points, dtype=float)
+# Optional QA/diagnostics: also write the radius mean used for the LQ25 subset
+seg_lq25_avgradius = np.zeros(num_points, dtype=float)
+
+# --------------------------------
+# Helper: lowest-quartile selection (by radius) + mean of power on the same indices
+# --------------------------------
+def lq25_mean_for_segment(seg_indices):
+    
+    #Given indices of points in a segment, select the lowest 25% by radius
+    #and return:
+    #  (mean_power_over_selected_points, mean_radius_of_selected_points, count_selected)
+    #Returns (0.0, 0.0, 0) if no valid data.
+   
+    # Build a list of (radius, idx) for finite radius and finite power
+    pairs = []
+    for idx in seg_indices:
+        r = radius[idx]
+        p = power[idx]
+        if np.isfinite(r) and np.isfinite(p):
+            pairs.append((r, idx))
+
+    n = len(pairs)
+    if n == 0:
+        return (0.0, 0.0, 0)
+
+    # Sort ascending by radius
+    pairs.sort(key=lambda t: t[0])
+
+    # Take the lowest ceil(25%) of them
+    k = int(math.ceil(0.25 * n))
+    if k < 1:
+        k = 1
+
+    # Compute means on the selected subset
+    sel_power_sum = 0.0
+    sel_radius_sum = 0.0
+    for i in range(k):
+        r, idx = pairs[i]
+        sel_radius_sum += r
+        sel_power_sum  += power[idx]
+
+    return (sel_power_sum / float(k), sel_radius_sum / float(k), k)
+
+# --------------------------------
+# Do the per-segment aggregation and paint the results
+# --------------------------------
+unique_segments = np.unique(seg_id)
+
+# Build a segment → indices map for efficiency
+seg_to_indices = {}
+for i in range(num_points):
+    s = int(seg_id[i])
+    if s not in seg_to_indices:
+        seg_to_indices[s] = []
+    seg_to_indices[s].append(i)
+
+for s in unique_segments:
+    indices = seg_to_indices.get(int(s), [])
+    if len(indices) == 0:
+        continue
+
+    avg_pwr, avg_rad, k = lq25_mean_for_segment(indices)
+
+    # Paint across the whole segment (per-point)
+    seg_lq25_avgpower[indices] = avg_pwr
+    seg_lq25_avgradius[indices] = avg_rad
+
+# --------------------------------
+# Attach arrays & output
+# --------------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+# Segment_LQ25_AvgPower: the main output desired
+arr_p = numpy_support.numpy_to_vtk(seg_lq25_avgpower, deep=1)
+arr_p.SetName("Segment_Power")
+out.GetPointData().AddArray(arr_p)
+
+"""
+pf10.OutputDataSetType = 'vtkPolyData'
+pf10.RequestInformationScript = ''
+pf10.RequestUpdateExtentScript = ''
+pf10.PythonPath = ''
+pf10.UpdatePipeline()
+
+# -------------------------
+# 14) Programmable Filter 11
+# Computes power by pressure drop
+# -------------------------
+pf11 = ProgrammableFilter(Input=[pf10])
+pf11.Script = r"""
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+import math
+
+# -----------------------------
+# Parameters / toggles
+# -----------------------------
+USE_BLANKING = False        # Set True to exclude masked points
+VALID_BLANKING_VALUE = 0    # Change to 1 if your data uses 1 as "valid"
+EPS = 1e-14
+
+# For Segmental_FFR, write NaN if p_start is non-finite or too small?
+FFR_WRITE_NAN_WHEN_BAD_BASELINE = True
+FFR_MIN_BASELINE = 1e-12
+
+# -----------------------------
+# Input handling (PolyData or MultiBlock[0])
+# -----------------------------
+inp = self.GetInputDataObject(0, 0)
+if inp is None:
+    raise RuntimeError("No input on port 0.")
+
+if isinstance(inp, vtk.vtkMultiBlockDataSet):
+    poly = inp.GetBlock(0)
+else:
+    poly = inp
+
+if poly is None or poly.GetPoints() is None:
+    raise RuntimeError("Input centerline PolyData missing or has no points.")
+
+num_points = poly.GetNumberOfPoints()
+pd = poly.GetPointData()
+
+# -----------------------------
+# Required arrays
+# -----------------------------
+is_inlet_vtk   = pd.GetArray("IsInlet")
+is_outlet_vtk  = pd.GetArray("IsOutlet")
+pressure_vtk   = pd.GetArray("pressure")
+
+if is_inlet_vtk is None:
+    raise RuntimeError("Missing required array: 'IsInlet' (point-data).")
+if is_outlet_vtk is None:
+    raise RuntimeError("Missing required array: 'IsOutlet' (point-data).")
+if pressure_vtk is None:
+    raise RuntimeError("Missing required array: 'pressure' (point-data).")
+
+# Optional arrays used for flow fallback, gating, and segment-level stats
+flow_vtk          = pd.GetArray("Flow")                 # preferred if present
+filtered_area_vtk = pd.GetArray("Filtered_Area")        # for flow fallback
+velocity_vtk      = pd.GetArray("velocity")             # for flow fallback
+blanking_vtk      = pd.GetArray("Blanking") if USE_BLANKING else None
+segment_vtk       = pd.GetArray("segment_ID")           # needed for segment-wise outputs
+
+# -----------------------------
+# Convert to NumPy
+# -----------------------------
+points_np   = numpy_support.vtk_to_numpy(poly.GetPoints().GetData()).astype(float, copy=False)
+is_inlet    = numpy_support.vtk_to_numpy(is_inlet_vtk).astype(int, copy=False)
+is_outlet   = numpy_support.vtk_to_numpy(is_outlet_vtk).astype(int, copy=False)
+pressure    = numpy_support.vtk_to_numpy(pressure_vtk).astype(float, copy=False)
+
+flow = None
+if flow_vtk is not None:
+    flow = numpy_support.vtk_to_numpy(flow_vtk).astype(float, copy=False)
+
+filtered_area = numpy_support.vtk_to_numpy(filtered_area_vtk).astype(float, copy=False) if filtered_area_vtk is not None else None
+velocity      = numpy_support.vtk_to_numpy(velocity_vtk).astype(float, copy=False) if velocity_vtk is not None else None
+blanking      = numpy_support.vtk_to_numpy(blanking_vtk) if blanking_vtk is not None else None
+segment_id    = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False) if segment_vtk is not None else None
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def add_array(out_poly, name, arr, num_comps=1):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    vtk_arr.SetNumberOfComponents(num_comps)
+    out_poly.GetPointData().AddArray(vtk_arr)
+
+def build_connectivity(polydata):
+    N = polydata.GetNumberOfPoints()
+    adj = {i: [] for i in range(N)}
+    for cid in range(polydata.GetNumberOfCells()):
+        cell = polydata.GetCell(cid)
+        npts = cell.GetNumberOfPoints()
+        for j in range(npts - 1):
+            a = cell.GetPointId(j)
+            b = cell.GetPointId(j + 1)
+            if b not in adj[a]:
+                adj[a].append(b)
+            if a not in adj[b]:
+                adj[b].append(a)
+    return adj
+
+def multi_source_bfs(starts, adj, mask=None, with_parent=False):
+    
+    #If with_parent=True, returns (visited, parent, dist)
+    #Otherwise returns visited.
+    #mask: if provided, only traverse nodes with mask[node]==True
+    
+    N = len(adj)
+    visited = np.zeros(N, dtype=bool)
+    parent = np.full(N, -1, dtype=np.int64) if with_parent else None
+    dist = np.full(N, np.inf, dtype=float) if with_parent else None
+    q = deque()
+
+    for s in starts:
+        if 0 <= s < N:
+            if mask is None or mask[s]:
+                visited[s] = True
+                if with_parent:
+                    dist[s] = 0.0
+                    parent[s] = -1
+                q.append(s)
+
+    while q:
+        u = q.popleft()
+        for v in adj[u]:
+            if mask is not None and not mask[v]:
+                continue
+            if not visited[v]:
+                visited[v] = True
+                if with_parent:
+                    parent[v] = u
+                    dist[v] = dist[u] + 1.0
+                q.append(v)
+
+    if with_parent:
+        return visited, parent, dist
+    else:
+        return visited
+
+# -----------------------------
+# Determine valid path nodes via inlet/outlet reachability
+# -----------------------------
+adj = build_connectivity(poly)
+
+inlet_idx  = np.where(is_inlet == 1)[0]
+outlet_idx = np.where(is_outlet == 1)[0]
+
+if inlet_idx.size == 0 or outlet_idx.size == 0:
+    out = self.GetOutput()
+    out.DeepCopy(poly)
+    # Attach safeties
+    add_array(out, "Power_PressureDrop", np.zeros(num_points, dtype=float))
+    if segment_id is not None:
+        add_array(out, "Segment_Power_PressureDrop", np.zeros(num_points, dtype=float))
+        add_array(out, "Segmental_FFR", np.zeros(num_points, dtype=float))
+    raise RuntimeError("No inlets or outlets present. Arrays written as zeros.")
+
+reach_in  = multi_source_bfs(inlet_idx,  adj)          # reachability from inlets
+reach_out = multi_source_bfs(outlet_idx, adj)          # reachability from outlets
+valid_mask = reach_in & reach_out                      # nodes that can lie on an inlet→outlet path
+valid_idx = np.where(valid_mask)[0]
+valid_set = set(valid_idx.tolist())
+
+# Now compute parent/dist on the valid subgraph, rooted at inlets
+_, parent, dist = multi_source_bfs(inlet_idx, adj, mask=valid_mask, with_parent=True)
+
+# -----------------------------
+# Tangent (for flow fallback) and flow
+# -----------------------------
+tangent = np.zeros((num_points, 3), dtype=float)
+
+# Only needed if we must compute flow
+need_flow_fallback = (flow is None) and (filtered_area is not None) and (velocity is not None)
+
+if need_flow_fallback:
+    for i in valid_idx:
+        neigh = [n for n in adj[i] if n in valid_set]
+        if not neigh:
+            continue
+        vecs = np.array([points_np[n] - points_np[i] for n in neigh], dtype=float)
+        t = vecs.sum(axis=0)
+        nrm = np.linalg.norm(t)
+        if nrm > EPS and np.isfinite(nrm):
+            tangent[i] = t / nrm
+
+    # Compute signed flow = (v·tangent) * area, gated by area and (optional) blanking
+    flow = np.zeros(num_points, dtype=float)
+    for i in valid_idx:
+        if filtered_area is None or velocity is None:
+            continue
+        if not np.isfinite(filtered_area[i]) or filtered_area[i] <= 0.0:
+            continue
+        if USE_BLANKING and blanking is not None and blanking[i] != VALID_BLANKING_VALUE:
+            continue
+
+        t = tangent[i]
+        if np.linalg.norm(t) <= EPS:
+            continue
+
+        v = velocity[i]
+        if not np.all(np.isfinite(v)):
+            continue
+
+        flow[i] = float(np.dot(v, t)) * float(filtered_area[i])
+
+elif flow is None:
+    # If we cannot compute flow, create a zero array (per-point power by pressure drop will be zero except inlets)
+    flow = np.zeros(num_points, dtype=float)
+
+# -----------------------------
+# Per-point: Power_PressureDrop
+#   inlet nodes -> 1.0 (requested)
+#   else dp = p_parent - p_i ; Power_PD = dp * Flow(i)
+# -----------------------------
+power_pd = np.zeros(num_points, dtype=float)
+
+for i in range(num_points):
+    if is_inlet[i] == 1:
+        power_pd[i] = 1.0
+        continue
+
+    if not valid_mask[i]:
+        # not on any inlet→outlet route; leave at 0.0
+        continue
+
+    up = parent[i]  # upstream node toward inlet on the valid BFS tree
+    if up < 0 or not np.isfinite(pressure[i]) or not np.isfinite(pressure[up]):
+        continue
+
+    # Optional gating: skip if area invalid or blanked off (to avoid writing spurious values)
+    if USE_BLANKING and blanking is not None and blanking[i] != VALID_BLANKING_VALUE:
+        continue
+    if filtered_area is not None and (not np.isfinite(filtered_area[i]) or filtered_area[i] <= 0.0):
+        continue
+
+    dp_i = float(pressure[up] - pressure[i])   # upstream - downstream
+    q_i  = float(flow[i])                      # flow at current point (as requested)
+    if np.isfinite(q_i):
+        power_pd[i] = dp_i * q_i
+
+# -----------------------------
+# Segment-wise:
+#   For each segment:
+#       start = node with MIN dist (most upstream within valid_mask)
+#       end   = node with MAX dist (most downstream within valid_mask)
+#   Segment_Power_PressureDrop = (p_start - p_end) * flow_start
+#   Segmental_FFR              = p_end / p_start
+#   Painted constant across the whole segment.
+# -----------------------------
+segment_power_pd = None
+segmental_ffr    = None
+if segment_id is not None:
+    segment_power_pd = np.zeros(num_points, dtype=float)
+    # FFR commonly in [0,1]; we compute raw ratio p_end/p_start and leave as-is
+    # (optionally write NaN when baseline is too small)
+    if FFR_WRITE_NAN_WHEN_BAD_BASELINE:
+        segmental_ffr = np.full(num_points, np.nan, dtype=float)
+    else:
+        segmental_ffr = np.zeros(num_points, dtype=float)
+
+    # Build segment -> indices map, but only consider indices in the valid path set
+    unique_segments = np.unique(segment_id)
+    seg_to_indices = {int(s): [] for s in unique_segments}
+    for i in valid_idx:
+        seg_to_indices[int(segment_id[i])].append(i)
+
+    for s in unique_segments:
+        inds = seg_to_indices.get(int(s), [])
+        if len(inds) == 0:
+            # No valid nodes for this segment along inlet→outlet routes
+            continue
+
+        # Determine start (min dist) and end (max dist) within the segment
+        dvals = np.array([dist[i] for i in inds], dtype=float)
+        finite_mask = np.isfinite(dvals)
+        if not np.any(finite_mask):
+            continue
+
+        inds_f = np.array(inds, dtype=int)[finite_mask]
+        dvals_f = dvals[finite_mask]
+
+        start_idx = inds_f[np.argmin(dvals_f)]
+        end_idx   = inds_f[np.argmax(dvals_f)]
+
+        p_start = float(pressure[start_idx]) if np.isfinite(pressure[start_idx]) else np.nan
+        p_end   = float(pressure[end_idx])   if np.isfinite(pressure[end_idx])   else np.nan
+        q_start = float(flow[start_idx])     if np.isfinite(flow[start_idx])     else np.nan
+
+        # Segment-level power from pressure drop
+        if np.isnan(p_start) or np.isnan(p_end) or np.isnan(q_start):
+            val_power = 0.0
+        else:
+            val_power = (p_start - p_end) * q_start
+
+        # Segmental FFR (pressure ratio: end/start)
+        if np.isnan(p_start) or np.isnan(p_end) or abs(p_start) <= FFR_MIN_BASELINE:
+            val_ffr = np.nan if FFR_WRITE_NAN_WHEN_BAD_BASELINE else 0.0
+        else:
+            val_ffr = p_end / p_start
+
+        # Paint across ALL points in the segment (not just valid path points)
+        seg_inds_all = np.where(segment_id == int(s))[0]
+        segment_power_pd[seg_inds_all] = val_power
+        segmental_ffr[seg_inds_all]    = val_ffr
+
+# -----------------------------
+# Output
+# -----------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+add_array(out, "Power_PressureDrop", power_pd)
+if segment_power_pd is not None:
+    add_array(out, "Segment_Power_PressureDrop", segment_power_pd)
+if segmental_ffr is not None:
+    add_array(out, "Segmental_FFR", segmental_ffr)
+"""
+pf11.OutputDataSetType = 'vtkPolyData'
+pf11.RequestInformationScript = ''
+pf11.RequestUpdateExtentScript = ''
+pf11.PythonPath = ''
+pf11.UpdatePipeline()
