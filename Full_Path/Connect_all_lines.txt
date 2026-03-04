@@ -1,0 +1,332 @@
+# The objective of this script is to clean at a very low threshold,
+# and then connect all points that are currently listed as endpoints
+# but are within a certain threshold of each other
+
+import vtk
+import numpy as np
+from vtkmodules.util import numpy_support
+
+# Input
+input_data = self.GetInputDataObject(0,0) # acquires the data from the 
+poly = vtk.vtkPolyData.SafeDownCast(input_data) # This should send poly data into a more pliable form
+
+output = self.GetOutput()
+output_data = self.GetOutputDataObject(0)
+
+# Deep copy input to output to preserve geometry and existing arrays
+output.DeepCopy(input_data)
+
+try:
+    locator = vtk.vtkStaticPointLocator()
+except:
+    locator = vtk.vtkPointLocator()
+locator.SetDataSet(poly)
+locator.BuildLocator()
+
+# Geometry: reuse points; copy lines and append new ones
+points = vtk.vtkPoints()
+points.ShallowCopy(poly.GetPoints())
+
+lines = vtk.vtkCellArray()
+lines.DeepCopy(poly.GetLines())
+
+num_cells_before = poly.GetNumberOfCells()
+
+# -----Helper Functions-----
+# Convenience to fetch GroupIds per-point (from incident cell)
+group_arr_in = poly.GetCellData().GetArray("GroupIds")
+def group_from_point(pid, default=0):
+    if group_arr_in is None:
+        return int(default)
+    ids = vtk.vtkIdList()
+    poly.GetPointCells(int(pid), ids)
+    if ids.GetNumberOfIds() > 0:
+        cid = ids.GetId(0)
+        # Handle scalar (1-component) arrays robustly
+        try:
+            return int(group_arr_in.GetTuple1(cid))
+        except AttributeError:
+            return int(group_arr_in.GetValue(cid))
+    return int(default)
+
+
+def append_scalar(arr, val):
+    # Append a single scalar to a 1-component array robustly.
+    
+    try:
+        arr.InsertNextValue(val)
+    except AttributeError:
+        try:
+            arr.InsertNextTypedTuple([val])
+        except AttributeError:
+            old_n = arr.GetNumberOfTuples()
+            arr.SetNumberOfTuples(old_n + 1)
+            try:
+                arr.SetTuple1(old_n, val)
+            except AttributeError:
+                arr.SetTuple(old_n, [val])
+
+
+# What needs to happen here is we need to locate endpoints, that being points marked by the IsOutlet marker, and then check the distance between them all.  So the two ways to do that would either be look out by 0.01 cm in all directions and see what you find, or tag the distance between the current endpoint and all other endpoints, and any that fall less than 0.01 cm need to be connected.  
+
+# So let's start by finding the inlet and outlets fresh.  That's all old script.
+
+#------ Step 1, Find current inlet and outlets -----#
+
+# Get 'CenterlineIds' from CellData
+id_array = poly.GetCellData().GetArray("CenterlineIds")
+ids = numpy_support.vtk_to_numpy(id_array)
+
+# Get 'GroupIds' from CellData
+group_array = poly.GetCellData().GetArray("GroupIds")
+group_ids = numpy_support.vtk_to_numpy(group_array)
+
+
+
+# Build connectivity map from cells.  It is a dictionary that matches what other point every point connects to.
+connectivity = {i: [] for i in range(poly.GetNumberOfPoints())}
+for cell_id in range(poly.GetNumberOfCells()):
+    cell = poly.GetCell(cell_id)
+    num_pts = cell.GetNumberOfPoints()
+    for i in range(num_pts - 1):
+        p1 = cell.GetPointId(i)
+        p2 = cell.GetPointId(i + 1)
+        connectivity[p1].append(p2)
+        connectivity[p2].append(p1)
+for entries in connectivity:
+    connectivity[entries] = list(set(connectivity[entries]))
+
+# Map cell IDs to point IDs
+point_ids = np.full(poly.GetNumberOfPoints(), -1)
+for cell_id in range(poly.GetNumberOfCells()):
+    cell = poly.GetCell(cell_id)
+    for i in range(cell.GetNumberOfPoints()):
+        pid = cell.GetPointId(i)
+        point_ids[pid] = ids[cell_id]
+
+
+# Find inlet point: first point from a cell with GroupId == 0
+inlet_index = None
+for cell_id in range(poly.GetNumberOfCells()):
+    if group_ids[cell_id] == 0:
+        cell = poly.GetCell(cell_id)
+        inlet_index = cell.GetPointId(0)
+        break
+
+# Identify outlet points (one neighbor, not inlet)
+outlet_indices = [i for i in range(poly.GetNumberOfPoints()) if len(connectivity[i]) <= 1 and i != inlet_index]
+
+# Mark inlet and outlet points
+inlet_array = np.zeros(poly.GetNumberOfPoints())
+outlet_array = np.zeros(poly.GetNumberOfPoints())
+
+inlet_array[inlet_index] = 1
+for oid in outlet_indices:
+    outlet_array[oid] = 1
+
+# Step 2, Prepare/extend CenterlineIds 
+existing_ids = poly.GetCellData().GetArray("CenterlineIds")
+
+if existing_ids is not None and existing_ids.GetNumberOfComponents() == 1:
+    new_centerline_ids = existing_ids.NewInstance()
+    new_centerline_ids.DeepCopy(existing_ids)
+    new_centerline_ids.SetName("CenterlineIds")
+    rmin, rmax = existing_ids.GetRange()
+    next_id = int(rmax) + 1
+else:
+    new_centerline_ids = vtk.vtkIntArray()
+    new_centerline_ids.SetName("CenterlineIds")
+    new_centerline_ids.SetNumberOfComponents(1)
+    for i in range(num_cells_before):
+        append_scalar(new_centerline_ids, int(next_id))
+    next_id = int(num_cells_before)
+# We will record per-new-cell values for a few known arrays
+new_groupids_vals = []  # per new line cell
+new_blanking_vals = []  # per new line cell (default 0)
+
+# ----- Step 3, find each outlet and draw a sphere around it of the given radius r.  If you hit another point marked as an outlet, draw another line to it
+
+outlet_mask = outlet_array > 0.5  # robust to float/VTK conversion
+outlet_ids = np.flatnonzero(outlet_mask)
+
+# Fetch points as an (N,3) NumPy array (fast vector access)
+pts_np = numpy_support.vtk_to_numpy(poly.GetPoints().GetData())
+
+
+r = 0.01  # threshold, in the same units as your data
+
+idlist = vtk.vtkIdList()
+pairs = []                         
+# Optional: if you want to avoid duplicates deterministically
+# seen = set()
+
+for idx, i in enumerate(outlet_ids):
+    # (a) get the coordinate
+    pi = pts_np[i]  # shape (3,)
+
+    # (b) find neighbors within the radius
+    idlist.Reset()
+    locator.FindPointsWithinRadius(r, pi, idlist)
+
+
+    # (c) keep only *other* outlets and avoid double-counting
+    for k in range(idlist.GetNumberOfIds()):
+        j = idlist.GetId(k)
+        if j <= i:                   # ensures each pair appears once
+            continue
+        if not outlet_mask[j]:       # only consider outlet-to-outlet
+            continue
+                
+        pairs.append((i, j))
+
+added_segments = 0
+
+# Responsible for connecting the given points in a pair by a line
+for (idA, idB) in pairs:
+    if idA == idB:
+        continue  # safety: skip zero-length
+
+    # (Optional) Skip if a line already exists between them
+    if idB in connectivity[idA]: continue
+
+    line = vtk.vtkLine()
+    line.GetPointIds().SetId(0, idA)
+    line.GetPointIds().SetId(1, idB)
+    lines.InsertNextCell(line)
+
+    # Extend CenterlineIds (you already set up next_id earlier)
+    append_scalar(new_centerline_ids, int(next_id))
+    next_id += 1
+
+    # Choose GroupIds/Blanking for this new cell (you already have helpers)
+    new_groupids_vals.append(group_from_point(idA, default=0))
+    new_blanking_vals.append(0)
+
+    added_segments += 1
+
+
+# === Produce output polydata ===
+out_poly = vtk.vtkPolyData()
+out_poly.SetPoints(points)
+out_poly.SetLines(lines)
+
+# ---- Preserve *Point Data* arrays (safe: we did not change points) ----
+out_point_data = out_poly.GetPointData()
+out_point_data.ShallowCopy(poly.GetPointData())
+
+# ---- Build *Cell Data* arrays, extending all arrays to match new cell count ----
+out_cell_data = out_poly.GetCellData()
+
+num_cells_after = lines.GetNumberOfCells()
+assert num_cells_after == num_cells_before + added_segments
+
+# Helper to append tuples to a data array
+
+def append_tuple(arr, values):
+ 
+    #Append one tuple (or scalar) to a VTK data array in a version-agnostic way.
+    #Works for vtkDataArray (numeric) and handles any #components.
+    
+    ncomp = arr.GetNumberOfComponents()
+
+    # Normalize values to a sequence of length ncomp
+    if ncomp == 1:
+        if isinstance(values, (list, tuple)):
+            val0 = values[0]
+        else:
+            val0 = values
+        # Try the most specific methods first
+        try:
+            # Some typed arrays have InsertNextValue
+            arr.InsertNextValue(val0)
+            return
+        except AttributeError:
+            pass
+        try:
+            # Some wrappers provide InsertNextTypedTuple even for 1 comp
+            arr.InsertNextTypedTuple([val0])
+            return
+        except AttributeError:
+            pass
+        # Fallback: grow and SetTuple1
+        old_n = arr.GetNumberOfTuples()
+        arr.SetNumberOfTuples(old_n + 1)
+        try:
+            arr.SetTuple1(old_n, val0)  # exists on vtkDataArray
+        except AttributeError:
+            # Very old fallback: SetTuple with a 1-length list
+            arr.SetTuple(old_n, [val0])
+        return
+    else:
+        # Multi-component
+        if not isinstance(values, (list, tuple)) or len(values) != ncomp:
+            values = [0] * ncomp
+
+        try:
+            arr.InsertNextTypedTuple(values)
+            return
+        except AttributeError:
+            pass
+        try:
+            # Older VTK
+            arr.InsertNextTuple(values)
+            return
+        except AttributeError:
+            pass
+        # Last resort: grow and SetTuple
+        old_n = arr.GetNumberOfTuples()
+        arr.SetNumberOfTuples(old_n + 1)
+        arr.SetTuple(old_n, values)
+
+# Extend every existing CellData array (except CenterlineIds, handled separately)
+cd_in = poly.GetCellData()
+for i in range(cd_in.GetNumberOfArrays()):
+    arr_in = cd_in.GetArray(i)
+    if arr_in is None:
+        continue
+    name = arr_in.GetName() or ""
+    if name == "CenterlineIds":
+        continue  # we will add our rebuilt array
+
+    arr_out = arr_in.NewInstance()
+    arr_out.DeepCopy(arr_in)
+    arr_out.SetName(name)
+
+    # Decide defaults per array
+    if arr_out.IsA("vtkStringArray"):
+        defaults = ["" for _ in range(added_segments)]
+        # Append one-by-one
+        for _ in range(added_segments):
+            arr_out.InsertNextValue("")
+    else:
+        # Choose per-cell values:
+        if name == "GroupIds":
+            for val in new_groupids_vals:
+                append_tuple(arr_out, int(val))
+        elif name == "Blanking":
+            for val in new_blanking_vals:
+                append_tuple(arr_out, int(val))
+        else:
+            # Generic zero-fill with correct component count
+            ncomp = arr_out.GetNumberOfComponents()
+            zero = 0 if ncomp == 1 else [0]*ncomp
+            for _ in range(added_segments):
+                append_tuple(arr_out, zero)
+
+    out_cell_data.AddArray(arr_out)
+
+# Finally add the updated CenterlineIds
+out_cell_data.AddArray(new_centerline_ids)
+
+# Preserve active cell arrays if they existed
+if cd_in.GetScalars():
+    out_cell_data.SetActiveScalars(cd_in.GetScalars().GetName())
+if cd_in.GetVectors():
+    out_cell_data.SetActiveVectors(cd_in.GetVectors().GetName())
+if cd_in.GetNormals():
+    out_cell_data.SetActiveNormals(cd_in.GetNormals().GetName())
+if cd_in.GetTCoords():
+    out_cell_data.SetActiveTCoords(cd_in.GetTCoords().GetName())
+
+# Finalize
+output_data.ShallowCopy(out_poly)

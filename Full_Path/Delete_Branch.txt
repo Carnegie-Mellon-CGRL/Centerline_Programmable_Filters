@@ -1,0 +1,248 @@
+import vtk
+
+# === USER INPUT ===
+target_segment_id = 48  # delete points where segment_ID == this value
+
+# === INPUT/OUTPUT ===
+inp = self.GetInputDataObject(0, 0)
+out = self.GetOutputDataObject(0)
+
+poly = vtk.vtkPolyData.SafeDownCast(inp)
+if poly is None:
+    raise RuntimeError("Input is not vtkPolyData.")
+
+pd_in = poly.GetPointData()
+cd_in = poly.GetCellData()
+
+segment_arr = pd_in.GetArray("segment_ID")
+if segment_arr is None:
+    raise RuntimeError("PointData array 'segment_ID' not found.")
+
+num_points = poly.GetNumberOfPoints()
+num_cells  = poly.GetNumberOfCells()
+
+# ---------------------------
+# Helpers for robust tuple IO
+# ---------------------------
+def is_string_array(arr):
+    return arr.IsA("vtkStringArray")
+
+def is_integer_array(arr):
+    # Covers common integer vtkDataArray subclasses
+    return (arr.IsA("vtkIntArray") or
+            arr.IsA("vtkIdTypeArray") or
+            arr.IsA("vtkLongArray") or
+            arr.IsA("vtkLongLongArray") or
+            arr.IsA("vtkUnsignedIntArray") or
+            arr.IsA("vtkUnsignedLongArray") or
+            arr.IsA("vtkUnsignedLongLongArray") or
+            arr.IsA("vtkShortArray") or
+            arr.IsA("vtkUnsignedShortArray") or
+            arr.IsA("vtkCharArray") or
+            arr.IsA("vtkSignedCharArray") or
+            arr.IsA("vtkUnsignedCharArray"))
+
+def get_scalar(arr, idx):
+    # Returns a Python scalar (float for numeric, str for strings)
+    if is_string_array(arr):
+        return arr.GetValue(idx)
+    # For numeric arrays, GetTuple1 exists but returns float; that's okay—we'll cast if needed.
+    if hasattr(arr, "GetTuple1"):
+        return arr.GetTuple1(idx)
+    # Fallback
+    return arr.GetValue(idx)
+
+def get_tuple(arr, idx):
+    if is_string_array(arr):
+        return arr.GetValue(idx)
+    ncomp = arr.GetNumberOfComponents()
+    if ncomp == 1:
+        return get_scalar(arr, idx)
+    # Multi-component tuple (returns a Python tuple of floats)
+    return arr.GetTuple(idx)
+
+def cast_for_array(arr, value):
+    """Cast a scalar or sequence to match the destination array numeric type."""
+    if is_string_array(arr):
+        # Ensure string
+        return value if isinstance(value, str) else str(value)
+    ncomp = arr.GetNumberOfComponents()
+    if ncomp == 1:
+        if is_integer_array(arr):
+            # Cast scalar to int
+            if isinstance(value, (list, tuple)):
+                value = value[0]
+            return int(value)
+        else:
+            # float/double/etc.
+            if isinstance(value, (list, tuple)):
+                value = value[0]
+            return float(value)
+    else:
+        # Multi-component
+        if not isinstance(value, (list, tuple)):
+            # replicate scalar to all components as a safe fallback
+            value = [value] * ncomp
+        if len(value) != ncomp:
+            value = list(value)[:ncomp] + [0] * max(0, ncomp - len(value))
+        if is_integer_array(arr):
+            return [int(v) for v in value]
+        else:
+            return [float(v) for v in value]
+
+def insert_value(arr, value):
+    """Insert a scalar or multi-component value with proper typing into arr."""
+    if is_string_array(arr):
+        arr.InsertNextValue(cast_for_array(arr, value))
+        return
+    ncomp = arr.GetNumberOfComponents()
+    casted = cast_for_array(arr, value)
+    if ncomp == 1:
+        arr.InsertNextValue(casted)
+    else:
+        if hasattr(arr, "InsertNextTypedTuple"):
+            arr.InsertNextTypedTuple(casted)
+        elif hasattr(arr, "InsertNextTuple"):
+            arr.InsertNextTuple(casted)
+        else:
+            # Very old VTK fallback
+            old_n = arr.GetNumberOfTuples()
+            arr.SetNumberOfTuples(old_n + 1)
+            arr.SetTuple(old_n, casted)
+
+# ---------------------------------------
+# Step 1: Keep mask by segment_ID != target
+# ---------------------------------------
+keep_point = [True] * num_points
+for pid in range(num_points):
+    seg_val = get_scalar(segment_arr, pid)
+    # Cast to int so 48.0 == 48
+    if int(seg_val) == int(target_segment_id):
+        keep_point[pid] = False
+
+# ---------------------------------------
+# Step 2: Repack points + PointData
+# ---------------------------------------
+old_to_new = [-1] * num_points
+
+new_points = vtk.vtkPoints()
+new_points.SetDataType(poly.GetPoints().GetDataType())
+
+pd_out = vtk.vtkPointData()
+point_array_pairs = []  # (arr_in, arr_out)
+
+for aidx in range(pd_in.GetNumberOfArrays()):
+    arr_in = pd_in.GetArray(aidx)
+    if arr_in is None:
+        continue
+    arr_out = arr_in.NewInstance()
+    arr_out.SetName(arr_in.GetName())
+    arr_out.SetNumberOfComponents(arr_in.GetNumberOfComponents())
+    point_array_pairs.append((arr_in, arr_out))
+    pd_out.AddArray(arr_out)
+
+keep_count = 0
+for pid in range(num_points):
+    if keep_point[pid]:
+        xyz = poly.GetPoint(pid)
+        new_points.InsertNextPoint(xyz)
+        old_to_new[pid] = keep_count
+        for arr_in, arr_out in point_array_pairs:
+            insert_value(arr_out, get_tuple(arr_in, pid))
+        keep_count += 1
+
+# ---------------------------------------
+# Step 3: Repack cells + CellData
+# ---------------------------------------
+new_lines = vtk.vtkCellArray()
+
+cd_out = vtk.vtkCellData()
+cell_array_pairs = []
+
+for aidx in range(cd_in.GetNumberOfArrays()):
+    arr_in = cd_in.GetArray(aidx)
+    if arr_in is None:
+        continue
+    arr_out = arr_in.NewInstance()
+    arr_out.SetName(arr_in.GetName())
+    arr_out.SetNumberOfComponents(arr_in.GetNumberOfComponents())
+    cell_array_pairs.append((arr_in, arr_out))
+    cd_out.AddArray(arr_out)
+
+kept_cells = 0
+gc = vtk.vtkGenericCell()
+
+for cid in range(num_cells):
+    poly.GetCell(cid, gc)
+    npts = gc.GetNumberOfPoints()
+
+    remapped = []
+    valid = True
+    for i in range(npts):
+        old_id = gc.GetPointId(i)
+        new_id = old_to_new[old_id]
+        if new_id < 0:
+            valid = False
+            break
+        remapped.append(new_id)
+
+    if not valid:
+        continue
+
+    # Insert remapped cell
+    if gc.GetCellType() == vtk.VTK_LINE and npts == 2:
+        line = vtk.vtkLine()
+        line.GetPointIds().SetId(0, remapped[0])
+        line.GetPointIds().SetId(1, remapped[1])
+        new_lines.InsertNextCell(line)
+    else:
+        ids = vtk.vtkIdList()
+        ids.SetNumberOfIds(npts)
+        for i in range(npts):
+            ids.SetId(i, remapped[i])
+        new_lines.InsertNextCell(ids)
+
+    # Copy cell data tuple with proper casting
+    for arr_in, arr_out in cell_array_pairs:
+        insert_value(arr_out, get_tuple(arr_in, cid))
+
+    kept_cells += 1
+
+# ---------------------------------------
+# Step 4: Assemble output and preserve actives
+# ---------------------------------------
+out_poly = vtk.vtkPolyData()
+out_poly.SetPoints(new_points)
+out_poly.SetLines(new_lines)
+
+# Attach data
+out_pd = out_poly.GetPointData()
+out_pd.ShallowCopy(pd_out)
+
+out_cd = out_poly.GetCellData()
+out_cd.ShallowCopy(cd_out)
+
+# Preserve actives
+if pd_in.GetScalars():
+    out_pd.SetActiveScalars(pd_in.GetScalars().GetName())
+if pd_in.GetVectors():
+    out_pd.SetActiveVectors(pd_in.GetVectors().GetName())
+if pd_in.GetNormals():
+    out_pd.SetActiveNormals(pd_in.GetNormals().GetName())
+if pd_in.GetTCoords():
+    out_pd.SetActiveTCoords(pd_in.GetTCoords().GetName())
+
+if cd_in.GetScalars():
+    out_cd.SetActiveScalars(cd_in.GetScalars().GetName())
+if cd_in.GetVectors():
+    out_cd.SetActiveVectors(cd_in.GetVectors().GetName())
+if cd_in.GetNormals():
+    out_cd.SetActiveNormals(cd_in.GetNormals().GetName())
+if cd_in.GetTCoords():
+    out_cd.SetActiveTCoords(cd_in.GetTCoords().GetName())
+
+out.ShallowCopy(out_poly)
+
+print(f"Deleted points with segment_ID == {target_segment_id}")
+print(f"Original points: {num_points}, kept: {keep_count}")
+print(f"Original cells : {num_cells},  kept: {kept_cells}")

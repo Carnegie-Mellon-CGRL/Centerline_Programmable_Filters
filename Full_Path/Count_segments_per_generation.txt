@@ -1,0 +1,138 @@
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+
+# ============================================================
+# Stand-alone "print-only" generation counter by segment_ID
+#   - Input:  PolyData or MultiBlock with PolyData in block 0
+#   - Uses:   'segment_ID', 'Generation' (point-data)
+#   - Prints: "Generation k: N segments" (unique segment_ID count)
+#   - No arrays are added to the output.
+#   - Optional QA (if present): 'z-branch_ID', 'z-branch_Parent'
+# ============================================================
+
+# -----------------------------
+# Ingest input
+# -----------------------------
+inp = self.GetInputDataObject(0, 0)
+
+pd = inp.GetPointData()
+npts = inp.GetNumberOfPoints()
+
+# -----------------------------
+# Required arrays
+# -----------------------------
+seg_vtk  = pd.GetArray("segment_ID")
+gen_vtk  = pd.GetArray("Generation")
+
+if seg_vtk is None:
+    raise RuntimeError("Missing required point-data array: 'segment_ID'.")
+if gen_vtk is None:
+    raise RuntimeError("Missing required point-data array: 'Generation'.")
+
+segment_id = numpy_support.vtk_to_numpy(seg_vtk).astype(np.int64, copy=False)
+generation = numpy_support.vtk_to_numpy(gen_vtk).astype(np.int64, copy=False)
+
+# -----------------------------
+# Optional QA arrays (branches)
+# -----------------------------
+z_branch_id_vtk     = pd.GetArray("z-branch_ID")
+z_branch_parent_vtk = pd.GetArray("z-branch_Parent")
+
+z_branch_id     = numpy_support.vtk_to_numpy(z_branch_id_vtk).astype(np.int64, copy=False) if z_branch_id_vtk is not None else None
+z_branch_parent = numpy_support.vtk_to_numpy(z_branch_parent_vtk).astype(np.int64, copy=False) if z_branch_parent_vtk is not None else None
+
+# -----------------------------
+# Sanity checks
+# -----------------------------
+if segment_id.shape[0] != npts or generation.shape[0] != npts:
+    raise RuntimeError("Array length mismatch with number of points.")
+
+# -----------------------------
+# Count unique segments per generation
+# -----------------------------
+unique_generations = np.unique(generation[np.isfinite(generation)])
+
+# Build a dict: gen_value -> count of unique segment_IDs present in that gen
+gen_to_segcount = {}
+gen_to_segs     = {}
+
+for g in unique_generations:
+    mask = (generation == g)
+    segs_in_gen = np.unique(segment_id[mask])
+    # Drop NaN-like or invalid if any (segment_id should be ints; keep all ints)
+    gen_to_segcount[int(g)] = int(segs_in_gen.size)
+    gen_to_segs[int(g)]     = segs_in_gen
+
+# -----------------------------
+# Print results
+# -----------------------------
+print("=============================================================================\n")
+
+# -----------------------------
+# Optional QA: branch generation consistency (if z-branch arrays exist)
+# Computes branch generations from z-branch_Parent and prints branch counts by generation.
+# This does not add arrays—print-only diagnostic.
+# -----------------------------
+if (z_branch_id is not None) and (z_branch_parent is not None):
+    # Build a per-branch parent mapping from point data (consistent across points of a branch)
+    # We'll pick the modal/first observed parent per branch_id.
+    valid_mask = (z_branch_id >= 0)
+    branch_ids_present = np.unique(z_branch_id[valid_mask])
+
+    # Map: branch_id -> parent_branch_id (choose first occurrence per branch id)
+    branch_parent_map = {}
+    for b in branch_ids_present:
+        # indices for this branch
+        idx = np.where(z_branch_id == b)[0]
+        if idx.size == 0:
+            continue
+        # choose the most frequent parent among these points (should be constant)
+        parents = z_branch_parent[idx]
+        # ignore -1 only if there are valid parents; otherwise keep -1 for trunk
+        # compute mode robustly
+        vals, counts = np.unique(parents, return_counts=True)
+        parent_choice = vals[np.argmax(counts)]
+        branch_parent_map[int(b)] = int(parent_choice)
+
+    # Compute branch generations by BFS on the branch graph
+    from collections import deque, defaultdict
+    # reverse adjacency: parent -> [children]
+    parent_to_children = defaultdict(list)
+    roots = []
+    for b, p in branch_parent_map.items():
+        if p < 0:
+            roots.append(b)
+        else:
+            parent_to_children[p].append(b)
+
+    # BFS to assign generation depth
+    branch_generation = {}
+    q = deque()
+    for r in roots:
+        branch_generation[int(r)] = 0
+        q.append(int(r))
+
+    while q:
+        u = q.popleft()
+        for v in parent_to_children.get(u, []):
+            branch_generation[int(v)] = branch_generation[u] + 1
+            q.append(int(v))
+
+    # Count branches per branch-generation
+    gen_counts_branch = {}
+    for b, g in branch_generation.items():
+        gen_counts_branch[g] = gen_counts_branch.get(g, 0) + 1
+
+    print("===== Branch Counts by Generation (using 'z-branch_ID' & 'z-branch_Parent') =====")
+    for g in sorted(gen_counts_branch.keys()):
+        print(f"Branch Generation {g}: {gen_counts_branch[g]} branches")
+    print("===============================================================================\n")
+else:
+    print("Note: 'z-branch_ID' and/or 'z-branch_Parent' not found. Skipping branch QA.\n")
+
+# -----------------------------
+# Output passthrough (no new arrays are added)
+# -----------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
