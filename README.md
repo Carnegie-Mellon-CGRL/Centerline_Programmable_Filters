@@ -25,5 +25,4 @@ If you want to resample the data points and apply additional arrays (Generations
  - Filter 14: “Segment-wise Poiseuille Resistance (Calculates segment-wise Poiseuille Resistance)
  - Filter 15: “Sidedness” (Splits centerlines into null for the first segment, then right or left randomly)
  - Filter 16: “Rename_arrays” (Done by pre-established conventions)
- - Filter 17: “Additional_Segment-wise_Functions” (Determines segment-wise Power, Ohm’s Law Resistance, pressure, and WSS)
- - Filter 18: “Power_by_Pressure_Drop” (Re-calculates Power based on a pressure drop)
+ - Filter 17: “Power_by_Pressure_Drop” (Re-calculates Power based on a pressure drop)
