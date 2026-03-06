@@ -1,9 +1,9 @@
 from paraview.simple import *
 import os
 
-centerlines_path = r"C:/Users/Admin/Documents/temp-2/JL22572.vtp"
-results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/JL_Branch_Testing/Simulations/JL22572_BL_Calc_3/JL22572_BL_Calc_3-converted-results/all_results_01000.vtu"
-results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/JL_Branch_Testing/Simulations/JL22572_BL_Calc_3/JL22572_BL_Calc_3-converted-results/all_results_01000.vtp"
+centerlines_path = r"C:/Users/Admin/Documents/temp-2/JB10652.vtp"
+results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/JB10652/all_results_01000.vtu"
+results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/JB10652/all_results_01000.vtp"
 
 # -------------------------
 # 1) Load data sources
@@ -1515,149 +1515,14 @@ pf9.RequestUpdateExtentScript = ''
 pf9.PythonPath = ''
 pf9.UpdatePipeline()
 
+
+
 # -------------------------
-# 13) Programmable Filter 10
-# Adds additional segment-wise arrays 
+# 34) Programmable Filter 10
+# Computes power by pressure drop
 # -------------------------
 pf10 = ProgrammableFilter(Input=[pf9])
 pf10.Script = r"""
-import vtk
-from vtkmodules.util import numpy_support
-import numpy as np
-import math
-
-# --------------------------------
-# Inputs (PolyData or MultiBlock with PolyData in block 0)
-# --------------------------------
-inp = self.GetInputDataObject(0, 0)
-if inp is None:
-    raise RuntimeError("No input on port 0.")
-
-if isinstance(inp, vtk.vtkMultiBlockDataSet):
-    poly = inp.GetBlock(0)
-else:
-    poly = inp
-
-if poly is None or poly.GetPoints() is None:
-    raise RuntimeError("Input centerline PolyData missing or has no points.")
-
-num_points = poly.GetNumberOfPoints()
-pd = poly.GetPointData()
-
-# --------------------------------
-# Required arrays
-# --------------------------------
-seg_vtk   = pd.GetArray("segment_ID")
-r_vtk     = pd.GetArray("Slice_Average_Radius")
-pwr_vtk   = pd.GetArray("Power")
-
-if seg_vtk is None:
-    raise RuntimeError("Missing required array: 'segment_ID' (point-data).")
-if r_vtk is None:
-    raise RuntimeError("Missing required array: 'Slice_Average_Radius' (point-data).")
-if pwr_vtk is None:
-    raise RuntimeError("Missing required array: 'Power' (point-data).")
-
-# Convert to NumPy
-seg_id = numpy_support.vtk_to_numpy(seg_vtk).astype(np.int64, copy=False)
-radius = numpy_support.vtk_to_numpy(r_vtk).astype(float, copy=False)
-power  = numpy_support.vtk_to_numpy(pwr_vtk).astype(float, copy=False)
-
-# --------------------------------
-# Allocate outputs (per-point, constant within segment)
-# --------------------------------
-seg_lq25_avgpower = np.zeros(num_points, dtype=float)
-# Optional QA/diagnostics: also write the radius mean used for the LQ25 subset
-seg_lq25_avgradius = np.zeros(num_points, dtype=float)
-
-# --------------------------------
-# Helper: lowest-quartile selection (by radius) + mean of power on the same indices
-# --------------------------------
-def lq25_mean_for_segment(seg_indices):
-    
-    #Given indices of points in a segment, select the lowest 25% by radius
-    #and return:
-    #  (mean_power_over_selected_points, mean_radius_of_selected_points, count_selected)
-    #Returns (0.0, 0.0, 0) if no valid data.
-   
-    # Build a list of (radius, idx) for finite radius and finite power
-    pairs = []
-    for idx in seg_indices:
-        r = radius[idx]
-        p = power[idx]
-        if np.isfinite(r) and np.isfinite(p):
-            pairs.append((r, idx))
-
-    n = len(pairs)
-    if n == 0:
-        return (0.0, 0.0, 0)
-
-    # Sort ascending by radius
-    pairs.sort(key=lambda t: t[0])
-
-    # Take the lowest ceil(25%) of them
-    k = int(math.ceil(0.25 * n))
-    if k < 1:
-        k = 1
-
-    # Compute means on the selected subset
-    sel_power_sum = 0.0
-    sel_radius_sum = 0.0
-    for i in range(k):
-        r, idx = pairs[i]
-        sel_radius_sum += r
-        sel_power_sum  += power[idx]
-
-    return (sel_power_sum / float(k), sel_radius_sum / float(k), k)
-
-# --------------------------------
-# Do the per-segment aggregation and paint the results
-# --------------------------------
-unique_segments = np.unique(seg_id)
-
-# Build a segment → indices map for efficiency
-seg_to_indices = {}
-for i in range(num_points):
-    s = int(seg_id[i])
-    if s not in seg_to_indices:
-        seg_to_indices[s] = []
-    seg_to_indices[s].append(i)
-
-for s in unique_segments:
-    indices = seg_to_indices.get(int(s), [])
-    if len(indices) == 0:
-        continue
-
-    avg_pwr, avg_rad, k = lq25_mean_for_segment(indices)
-
-    # Paint across the whole segment (per-point)
-    seg_lq25_avgpower[indices] = avg_pwr
-    seg_lq25_avgradius[indices] = avg_rad
-
-# --------------------------------
-# Attach arrays & output
-# --------------------------------
-out = self.GetOutput()
-out.DeepCopy(poly)
-
-# Segment_LQ25_AvgPower: the main output desired
-arr_p = numpy_support.numpy_to_vtk(seg_lq25_avgpower, deep=1)
-arr_p.SetName("Segment_Power")
-out.GetPointData().AddArray(arr_p)
-
-"""
-pf10.OutputDataSetType = 'vtkPolyData'
-pf10.RequestInformationScript = ''
-pf10.RequestUpdateExtentScript = ''
-pf10.PythonPath = ''
-pf10.UpdatePipeline()
-
-# -------------------------
-# 14) Programmable Filter 11
-# Computes power by pressure drop
-# -------------------------
-pf11 = ProgrammableFilter(Input=[pf10])
-pf11.Script = r"""
 import vtk
 from vtkmodules.util import numpy_support
 import numpy as np
@@ -1971,8 +1836,8 @@ if segment_power_pd is not None:
 if segmental_ffr is not None:
     add_array(out, "Segmental_FFR", segmental_ffr)
 """
-pf11.OutputDataSetType = 'vtkPolyData'
-pf11.RequestInformationScript = ''
-pf11.RequestUpdateExtentScript = ''
-pf11.PythonPath = ''
-pf11.UpdatePipeline()
+pf10.OutputDataSetType = 'vtkPolyData'
+pf10.RequestInformationScript = ''
+pf10.RequestUpdateExtentScript = ''
+pf10.PythonPath = ''
+pf10.UpdatePipeline()

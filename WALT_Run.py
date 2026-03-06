@@ -1,9 +1,9 @@
 from paraview.simple import *
 import os
 
-centerlines_path = r"C:/Users/Admin/Documents/Simvascular_Files/0-Centerlines/0-Final_Centerlines_Feb17/HP5159.vtp"
-results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/HP5159/all_results_01000.vtu"
-results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/HP5159/all_results_01000.vtp"
+centerlines_path = r"C:/Users/Admin/Documents/Simvascular_Files/0-Centerlines/0-Final_Centerlines_Feb17/JB10652.vtp"
+results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/JB10652/all_results_01000.vtu"
+results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/JB10652/all_results_01000.vtp"
 
 # -------------------------
 # 1) Load data sources
