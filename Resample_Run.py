@@ -1,9 +1,9 @@
 from paraview.simple import *
 import os
 
-centerlines_path = r"C:/Users/Admin/Documents/temp-2/JB10652.vtp"
-results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/JB10652/all_results_01000.vtu"
-results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/JB10652/all_results_01000.vtp"
+centerlines_path = r"C:/Users/Admin/Documents/temp-2/HP5159.vtp"
+results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/HP5159/all_results_01000.vtu"
+results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/HP5159/all_results_01000.vtp"
 
 # -------------------------
 # 1) Load data sources
@@ -1529,81 +1529,85 @@ import numpy as np
 from collections import deque
 import math
 
-# -----------------------------
+# --------------------------------
 # Parameters / toggles
-# -----------------------------
-USE_BLANKING = False        # Set True to exclude masked points
-VALID_BLANKING_VALUE = 0    # Change to 1 if your data uses 1 as "valid"
+# --------------------------------
+USE_BLANKING = False          # include all points; do not gate by Blanking
+VALID_BLANKING_VALUE = 0      # unused when USE_BLANKING is False
+
 EPS = 1e-14
-
-# For Segmental_FFR, write NaN if p_start is non-finite or too small?
-FFR_WRITE_NAN_WHEN_BAD_BASELINE = True
 FFR_MIN_BASELINE = 1e-12
+UNDEFINED_FILL_VALUE = 1.0  # for undefined FFR cases (easy-to-spot sentinel)
+LOG_UNDEFINED = True
 
-# -----------------------------
-# Input handling (PolyData or MultiBlock[0])
-# -----------------------------
+# --------------------------------
+# Input (PolyData or MultiBlock[0])
+# --------------------------------
 inp = self.GetInputDataObject(0, 0)
 if inp is None:
     raise RuntimeError("No input on port 0.")
 
-if isinstance(inp, vtk.vtkMultiBlockDataSet):
-    poly = inp.GetBlock(0)
-else:
-    poly = inp
-
+poly = inp.GetBlock(0) if isinstance(inp, vtk.vtkMultiBlockDataSet) else inp
 if poly is None or poly.GetPoints() is None:
     raise RuntimeError("Input centerline PolyData missing or has no points.")
 
 num_points = poly.GetNumberOfPoints()
 pd = poly.GetPointData()
 
-# -----------------------------
+# --------------------------------
 # Required arrays
-# -----------------------------
+# --------------------------------
 is_inlet_vtk   = pd.GetArray("IsInlet")
 is_outlet_vtk  = pd.GetArray("IsOutlet")
 pressure_vtk   = pd.GetArray("pressure")
+segment_vtk    = pd.GetArray("segment_ID")  # kept for your existing segment arrays
 
 if is_inlet_vtk is None:
-    raise RuntimeError("Missing required array: 'IsInlet' (point-data).")
+    raise RuntimeError("Missing required array: 'IsInlet'.")
 if is_outlet_vtk is None:
-    raise RuntimeError("Missing required array: 'IsOutlet' (point-data).")
+    raise RuntimeError("Missing required array: 'IsOutlet'.")
 if pressure_vtk is None:
-    raise RuntimeError("Missing required array: 'pressure' (point-data).")
+    raise RuntimeError("Missing required array: 'pressure'.")
+if segment_vtk is None:
+    raise RuntimeError("Missing required array: 'segment_ID'.")
 
-# Optional arrays used for flow fallback, gating, and segment-level stats
-flow_vtk          = pd.GetArray("Flow")                 # preferred if present
-filtered_area_vtk = pd.GetArray("Filtered_Area")        # for flow fallback
-velocity_vtk      = pd.GetArray("velocity")             # for flow fallback
+# Optional arrays (for Flow fallback)
+flow_vtk          = pd.GetArray("Flow")
+filtered_area_vtk = pd.GetArray("Filtered_Area")
+velocity_vtk      = pd.GetArray("velocity")
 blanking_vtk      = pd.GetArray("Blanking") if USE_BLANKING else None
-segment_vtk       = pd.GetArray("segment_ID")           # needed for segment-wise outputs
 
-# -----------------------------
-# Convert to NumPy
-# -----------------------------
+# --------------------------------
+# NumPy views
+# --------------------------------
 points_np   = numpy_support.vtk_to_numpy(poly.GetPoints().GetData()).astype(float, copy=False)
 is_inlet    = numpy_support.vtk_to_numpy(is_inlet_vtk).astype(int, copy=False)
 is_outlet   = numpy_support.vtk_to_numpy(is_outlet_vtk).astype(int, copy=False)
 pressure    = numpy_support.vtk_to_numpy(pressure_vtk).astype(float, copy=False)
+segment_id  = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False)
 
-flow = None
-if flow_vtk is not None:
-    flow = numpy_support.vtk_to_numpy(flow_vtk).astype(float, copy=False)
-
+flow = numpy_support.vtk_to_numpy(flow_vtk).astype(float, copy=False) if flow_vtk is not None else None
 filtered_area = numpy_support.vtk_to_numpy(filtered_area_vtk).astype(float, copy=False) if filtered_area_vtk is not None else None
 velocity      = numpy_support.vtk_to_numpy(velocity_vtk).astype(float, copy=False) if velocity_vtk is not None else None
 blanking      = numpy_support.vtk_to_numpy(blanking_vtk) if blanking_vtk is not None else None
-segment_id    = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False) if segment_vtk is not None else None
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def add_array(out_poly, name, arr, num_comps=1):
+# --------------------------------
+# Helpers
+# --------------------------------
+def add_point_array(out_poly, name, arr, num_comps=1):
     vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
     vtk_arr.SetName(name)
     vtk_arr.SetNumberOfComponents(num_comps)
     out_poly.GetPointData().AddArray(vtk_arr)
+
+def add_field_string_array(out_poly, name, messages):
+    if not messages:
+        return
+    sa = vtk.vtkStringArray()
+    sa.SetName(name)
+    for m in messages:
+        sa.InsertNextValue(m)
+    out_poly.GetFieldData().AddArray(sa)
 
 def build_connectivity(polydata):
     N = polydata.GetNumberOfPoints()
@@ -1621,17 +1625,11 @@ def build_connectivity(polydata):
     return adj
 
 def multi_source_bfs(starts, adj, mask=None, with_parent=False):
-    
-    #If with_parent=True, returns (visited, parent, dist)
-    #Otherwise returns visited.
-    #mask: if provided, only traverse nodes with mask[node]==True
-    
     N = len(adj)
     visited = np.zeros(N, dtype=bool)
     parent = np.full(N, -1, dtype=np.int64) if with_parent else None
     dist = np.full(N, np.inf, dtype=float) if with_parent else None
     q = deque()
-
     for s in starts:
         if 0 <= s < N:
             if mask is None or mask[s]:
@@ -1640,7 +1638,6 @@ def multi_source_bfs(starts, adj, mask=None, with_parent=False):
                     dist[s] = 0.0
                     parent[s] = -1
                 q.append(s)
-
     while q:
         u = q.popleft()
         for v in adj[u]:
@@ -1652,15 +1649,14 @@ def multi_source_bfs(starts, adj, mask=None, with_parent=False):
                     parent[v] = u
                     dist[v] = dist[u] + 1.0
                 q.append(v)
-
     if with_parent:
         return visited, parent, dist
     else:
         return visited
 
-# -----------------------------
-# Determine valid path nodes via inlet/outlet reachability
-# -----------------------------
+# --------------------------------
+# Valid subgraph & directed tree (parents/children)
+# --------------------------------
 adj = build_connectivity(poly)
 
 inlet_idx  = np.where(is_inlet == 1)[0]
@@ -1669,28 +1665,37 @@ outlet_idx = np.where(is_outlet == 1)[0]
 if inlet_idx.size == 0 or outlet_idx.size == 0:
     out = self.GetOutput()
     out.DeepCopy(poly)
-    # Attach safeties
-    add_array(out, "Power_PressureDrop", np.zeros(num_points, dtype=float))
-    if segment_id is not None:
-        add_array(out, "Segment_Power_PressureDrop", np.zeros(num_points, dtype=float))
-        add_array(out, "Segmental_FFR", np.zeros(num_points, dtype=float))
-    raise RuntimeError("No inlets or outlets present. Arrays written as zeros.")
+    add_point_array(out, "Power_PressureDrop", np.zeros(num_points))
+    add_point_array(out, "Segment_Power_PressureDrop", np.zeros(num_points))
+    add_point_array(out, "Segment_PressureAverage", np.zeros(num_points))
+    add_point_array(out, "Segment_FFR_perBranch", np.zeros(num_points))
+    add_point_array(out, "Segment_FFR_byPressureAverage", np.zeros(num_points))
+    add_point_array(out, "Parent_Branch", np.full(num_points, -1, dtype=np.int64))
+    # New branch arrays
+    add_point_array(out, "z-branch_ID", np.full(num_points, -1, dtype=np.int64))
+    add_point_array(out, "z-branch_Parent", np.full(num_points, -1, dtype=np.int64))
+    add_point_array(out, "z-branch_FFR", np.full(num_points, UNDEFINED_FILL_VALUE, dtype=float))
+    raise RuntimeError("No inlets or outlets present. Arrays written as defaults.")
 
-reach_in  = multi_source_bfs(inlet_idx,  adj)          # reachability from inlets
-reach_out = multi_source_bfs(outlet_idx, adj)          # reachability from outlets
-valid_mask = reach_in & reach_out                      # nodes that can lie on an inlet→outlet path
+reach_in  = multi_source_bfs(inlet_idx,  adj)
+reach_out = multi_source_bfs(outlet_idx, adj)
+valid_mask = reach_in & reach_out
 valid_idx = np.where(valid_mask)[0]
 valid_set = set(valid_idx.tolist())
 
-# Now compute parent/dist on the valid subgraph, rooted at inlets
+# Directed inlet-rooted tree on valid subgraph
 _, parent, dist = multi_source_bfs(inlet_idx, adj, mask=valid_mask, with_parent=True)
 
-# -----------------------------
-# Tangent (for flow fallback) and flow
-# -----------------------------
-tangent = np.zeros((num_points, 3), dtype=float)
+children = {i: [] for i in range(num_points)}
+for v in valid_idx:
+    u = parent[v]
+    if u >= 0:
+        children[u].append(v)
 
-# Only needed if we must compute flow
+# --------------------------------
+# Flow fallback (only if no Flow is present)
+# --------------------------------
+tangent = np.zeros((num_points, 3), dtype=float)
 need_flow_fallback = (flow is None) and (filtered_area is not None) and (velocity is not None)
 
 if need_flow_fallback:
@@ -1703,8 +1708,6 @@ if need_flow_fallback:
         nrm = np.linalg.norm(t)
         if nrm > EPS and np.isfinite(nrm):
             tangent[i] = t / nrm
-
-    # Compute signed flow = (v·tangent) * area, gated by area and (optional) blanking
     flow = np.zeros(num_points, dtype=float)
     for i in valid_idx:
         if filtered_area is None or velocity is None:
@@ -1713,128 +1716,316 @@ if need_flow_fallback:
             continue
         if USE_BLANKING and blanking is not None and blanking[i] != VALID_BLANKING_VALUE:
             continue
-
         t = tangent[i]
         if np.linalg.norm(t) <= EPS:
             continue
-
         v = velocity[i]
         if not np.all(np.isfinite(v)):
             continue
-
         flow[i] = float(np.dot(v, t)) * float(filtered_area[i])
-
 elif flow is None:
-    # If we cannot compute flow, create a zero array (per-point power by pressure drop will be zero except inlets)
     flow = np.zeros(num_points, dtype=float)
 
-# -----------------------------
-# Per-point: Power_PressureDrop
-#   inlet nodes -> 1.0 (requested)
-#   else dp = p_parent - p_i ; Power_PD = dp * Flow(i)
-# -----------------------------
+# --------------------------------
+# Per-point: Power_PressureDrop (kept as before)
+# --------------------------------
 power_pd = np.zeros(num_points, dtype=float)
-
 for i in range(num_points):
     if is_inlet[i] == 1:
         power_pd[i] = 1.0
         continue
-
     if not valid_mask[i]:
-        # not on any inlet→outlet route; leave at 0.0
         continue
-
-    up = parent[i]  # upstream node toward inlet on the valid BFS tree
+    up = parent[i]
     if up < 0 or not np.isfinite(pressure[i]) or not np.isfinite(pressure[up]):
         continue
-
-    # Optional gating: skip if area invalid or blanked off (to avoid writing spurious values)
-    if USE_BLANKING and blanking is not None and blanking[i] != VALID_BLANKING_VALUE:
-        continue
-    if filtered_area is not None and (not np.isfinite(filtered_area[i]) or filtered_area[i] <= 0.0):
-        continue
-
-    dp_i = float(pressure[up] - pressure[i])   # upstream - downstream
-    q_i  = float(flow[i])                      # flow at current point (as requested)
+    dp_i = float(pressure[up] - pressure[i])
+    q_i  = float(flow[i])
     if np.isfinite(q_i):
         power_pd[i] = dp_i * q_i
 
-# -----------------------------
-# Segment-wise:
-#   For each segment:
-#       start = node with MIN dist (most upstream within valid_mask)
-#       end   = node with MAX dist (most downstream within valid_mask)
-#   Segment_Power_PressureDrop = (p_start - p_end) * flow_start
-#   Segmental_FFR              = p_end / p_start
-#   Painted constant across the whole segment.
-# -----------------------------
-segment_power_pd = None
-segmental_ffr    = None
-if segment_id is not None:
-    segment_power_pd = np.zeros(num_points, dtype=float)
-    # FFR commonly in [0,1]; we compute raw ratio p_end/p_start and leave as-is
-    # (optionally write NaN when baseline is too small)
-    if FFR_WRITE_NAN_WHEN_BAD_BASELINE:
-        segmental_ffr = np.full(num_points, np.nan, dtype=float)
+# --------------------------------
+# Segment-level arrays (kept for compatibility)
+# --------------------------------
+unique_segments = np.unique(segment_id)
+seg_to_indices = {int(s): [] for s in unique_segments}
+for i in range(num_points):
+    seg_to_indices[int(segment_id[i])].append(i)
+
+segment_power_pd = np.zeros(num_points, dtype=float)
+segment_ffr_per_branch = np.zeros(num_points, dtype=float)
+segment_pressure_avg = np.full(num_points, np.nan, dtype=float)
+
+seg_mean_pressure = {}
+seg_start_idx = {}
+seg_end_idx = {}
+seg_start_dist = {}
+
+for s in unique_segments:
+    inds_all = seg_to_indices[int(s)]
+    if not inds_all:
+        seg_mean_pressure[int(s)] = np.nan
+        continue
+
+    pvals = np.array([pressure[i] for i in inds_all], dtype=float)
+    finite_mask = np.isfinite(pvals)
+    seg_mean = float(np.mean(pvals[finite_mask])) if np.any(finite_mask) else np.nan
+    seg_mean_pressure[int(s)] = seg_mean
+    segment_pressure_avg[np.array(inds_all, dtype=int)] = seg_mean
+
+    inds_valid = [i for i in inds_all if valid_mask[i] and np.isfinite(dist[i])]
+    if not inds_valid:
+        continue
+    dvals = np.array([dist[i] for i in inds_valid], dtype=float)
+    start_i = inds_valid[int(np.argmin(dvals))]
+    end_i   = inds_valid[int(np.argmax(dvals))]
+
+    seg_start_idx[int(s)] = start_i
+    seg_end_idx[int(s)]   = end_i
+    seg_start_dist[int(s)] = float(dist[start_i])
+
+    p_start = pressure[start_i] if np.isfinite(pressure[start_i]) else np.nan
+    p_end   = pressure[end_i]   if np.isfinite(pressure[end_i])   else np.nan
+    q_start = flow[start_i]     if np.isfinite(flow[start_i])     else np.nan
+
+    if np.isnan(p_start) or np.isnan(p_end) or np.isnan(q_start):
+        val_ffr   = 0.0
+        val_power = 0.0
     else:
-        segmental_ffr = np.zeros(num_points, dtype=float)
+        val_ffr   = (p_end / p_start) if abs(p_start) > FFR_MIN_BASELINE else 0.0
+        val_power = (p_start - p_end) * q_start
 
-    # Build segment -> indices map, but only consider indices in the valid path set
-    unique_segments = np.unique(segment_id)
-    seg_to_indices = {int(s): [] for s in unique_segments}
-    for i in valid_idx:
-        seg_to_indices[int(segment_id[i])].append(i)
+    seg_inds_all = np.array(inds_all, dtype=int)
+    segment_ffr_per_branch[seg_inds_all] = val_ffr
+    segment_power_pd[seg_inds_all]       = val_power
 
-    for s in unique_segments:
-        inds = seg_to_indices.get(int(s), [])
-        if len(inds) == 0:
-            # No valid nodes for this segment along inlet→outlet routes
+# --------------------------------
+# TOPOLOGICAL BRANCHING (authoritative)
+# Build true branches from the inlet-rooted tree:
+#   Branch = maximal chain from (root or junction) → (junction or leaf)
+# --------------------------------
+is_endpoint = np.zeros(num_points, dtype=bool)
+for i in valid_idx:
+    deg_children = len(children[i])
+    if parent[i] < 0 or deg_children != 1:
+        is_endpoint[i] = True
+
+branches = []  # list of dicts with: {'id', 'up_node', 'down_node', 'nodes'}
+end_node_to_branch = {}  # map downstream endpoint → branch_id
+
+branch_id_counter = 0
+
+# Start at all upstream endpoints; launch a branch along each outgoing child
+for u in valid_idx:
+    if not is_endpoint[u]:
+        continue
+    # For a root or junction, explore each outgoing child as a new branch
+    for c in children[u] if len(children[u]) > 0 else []:
+        # Walk down until next endpoint
+        nodes = []
+        curr = c
+        while True:
+            nodes.append(curr)
+            if is_endpoint[curr]:
+                break
+            # exactly one child by construction here
+            nxts = children[curr]
+            if len(nxts) != 1:
+                # Safety: if label got weird, break to avoid loop
+                break
+            curr = nxts[0]
+        b = {
+            'id': branch_id_counter,
+            'up_node': u,
+            'down_node': curr,
+            'nodes': nodes
+        }
+        branches.append(b)
+        end_node_to_branch[curr] = branch_id_counter
+        branch_id_counter += 1
+
+# Handle the special case: a root endpoint with **no children** (isolated root)
+# (rare on centerlines, but just in case — make a 0-length branch)
+for u in valid_idx:
+    if is_endpoint[u] and len(children[u]) == 0:
+        b = {
+            'id': branch_id_counter,
+            'up_node': u,
+            'down_node': u,
+            'nodes': [u]
+        }
+        branches.append(b)
+        end_node_to_branch[u] = branch_id_counter
+        branch_id_counter += 1
+
+num_branches = len(branches)
+
+# --------------------------------
+# Build branch parent relationships
+# Parent branch of branch B is the branch whose down_node equals B.up_node
+# --------------------------------
+branch_parent = np.full(num_branches, -1, dtype=np.int64)
+upnode_to_branch = {}  # for quick lookup if needed
+for b in branches:
+    upnode_to_branch[b['up_node']] = b['id']
+
+# Create mapping from endpoint nodes to branch ids (already have end_node_to_branch)
+for b in branches:
+    up = b['up_node']
+    if up in end_node_to_branch:
+        branch_parent[b['id']] = end_node_to_branch[up]  # parent branch id
+
+# --------------------------------
+# Branch mean pressures
+# --------------------------------
+branch_mean_pressure = np.full(num_branches, np.nan, dtype=float)
+for b in branches:
+    ps = np.array([pressure[i] for i in b['nodes']], dtype=float)
+    m = np.isfinite(ps)
+    branch_mean_pressure[b['id']] = float(np.mean(ps[m])) if np.any(m) else np.nan
+
+# --------------------------------
+# Branch FFR (z-branch_FFR): child_mean / parent_mean; trunks = 1.0; undefined = 100
+# --------------------------------
+z_branch_ffr_vals = np.full(num_branches, UNDEFINED_FILL_VALUE, dtype=float)
+messages = []
+
+# Identify trunk branches: those with branch_parent == -1
+trunks = [b['id'] for b in branches if branch_parent[b['id']] < 0]
+
+for bid in trunks:
+    z_branch_ffr_vals[bid] = 1.0  # trunk FFR
+
+for b in branches:
+    bid = b['id']
+    par = int(branch_parent[bid])
+    if par < 0:
+        continue  # already set to 1.0 for trunk
+    child_mean = branch_mean_pressure[bid]
+    parent_mean = branch_mean_pressure[par]
+    if (not np.isfinite(child_mean)) or (not np.isfinite(parent_mean)) or (abs(parent_mean) <= FFR_MIN_BASELINE):
+        z_branch_ffr_vals[bid] = UNDEFINED_FILL_VALUE
+        if LOG_UNDEFINED:
+            reason = []
+            if not np.isfinite(child_mean):
+                reason.append("child branch mean pressure not finite")
+            if not np.isfinite(parent_mean):
+                reason.append("parent branch mean pressure not finite")
+            elif abs(parent_mean) <= FFR_MIN_BASELINE:
+                reason.append(f"parent branch mean pressure too small (|p| ≤ {FFR_MIN_BASELINE})")
+            messages.append(f"[z-branch_FFR] Branch {bid} set to {UNDEFINED_FILL_VALUE} ({'; '.join(reason)}). Parent branch {par}.")
+    else:
+        z_branch_ffr_vals[bid] = float(child_mean / parent_mean)
+
+# --------------------------------
+# Paint branch arrays to points (default for non-valid points)
+# --------------------------------
+z_branch_id_arr     = np.full(num_points, -1, dtype=np.int64)
+z_branch_parent_arr = np.full(num_points, -1, dtype=np.int64)
+z_branch_ffr_arr    = np.full(num_points, UNDEFINED_FILL_VALUE, dtype=float)
+
+for b in branches:
+    pts = np.array(b['nodes'], dtype=int)
+    z_branch_id_arr[pts]     = b['id']
+    z_branch_parent_arr[pts] = int(branch_parent[b['id']])
+    z_branch_ffr_arr[pts]    = z_branch_ffr_vals[b['id']]
+
+# --------------------------------
+# OPTIONAL: keep your earlier segment-by-average arrays (for continuity)
+# We will compute a simple edge-based parent for segments to fill these; note that
+# the authoritative topology is given by z-branch_* arrays above.
+# --------------------------------
+# Edge-based (parent[v] -> v) segment transitions; choose earliest (min dist[v])
+seg_parent_map   = {}
+seg_boundary_dist = {}
+for v in valid_idx:
+    u = parent[v]
+    if u < 0:
+        continue
+    su = int(segment_id[u]); sv = int(segment_id[v])
+    if su == sv:
+        continue
+    dv = float(dist[v])
+    if (sv not in seg_parent_map) or (dv < seg_boundary_dist[sv]):
+        seg_parent_map[sv]   = su
+        seg_boundary_dist[sv] = dv
+
+segment_ffr_by_pressure_avg = np.full(num_points, UNDEFINED_FILL_VALUE, dtype=float)
+parent_branch_seg_arr       = np.full(num_points, -1, dtype=np.int64)
+
+# Determine segment roots (contain inlet points or no parent mapping)
+seg_roots = set(int(segment_id[i]) for i in inlet_idx if valid_mask[int(i)])
+if not seg_roots:
+    seg_roots = set(int(s) for s in unique_segments if int(s) not in seg_parent_map)
+
+# Build segment adjacency
+seg_children = {}
+for child_seg, par_seg in seg_parent_map.items():
+    seg_children.setdefault(par_seg, []).append(child_seg)
+
+# Traverse segment graph from roots
+visited_segments = set()
+queue = list(seg_roots)
+for r in seg_roots:
+    visited_segments.add(int(r))
+    inds = np.array(seg_to_indices.get(int(r), []), dtype=int)
+    if inds.size > 0:
+        segment_ffr_by_pressure_avg[inds] = 1.0
+        parent_branch_seg_arr[inds] = -1
+
+while queue:
+    par = int(queue.pop(0))
+    for ch in seg_children.get(par, []):
+        ch = int(ch)
+        if ch in visited_segments:
             continue
-
-        # Determine start (min dist) and end (max dist) within the segment
-        dvals = np.array([dist[i] for i in inds], dtype=float)
-        finite_mask = np.isfinite(dvals)
-        if not np.any(finite_mask):
-            continue
-
-        inds_f = np.array(inds, dtype=int)[finite_mask]
-        dvals_f = dvals[finite_mask]
-
-        start_idx = inds_f[np.argmin(dvals_f)]
-        end_idx   = inds_f[np.argmax(dvals_f)]
-
-        p_start = float(pressure[start_idx]) if np.isfinite(pressure[start_idx]) else np.nan
-        p_end   = float(pressure[end_idx])   if np.isfinite(pressure[end_idx])   else np.nan
-        q_start = float(flow[start_idx])     if np.isfinite(flow[start_idx])     else np.nan
-
-        # Segment-level power from pressure drop
-        if np.isnan(p_start) or np.isnan(p_end) or np.isnan(q_start):
-            val_power = 0.0
+        mean_child  = seg_mean_pressure.get(ch, np.nan)
+        mean_parent = seg_mean_pressure.get(par, np.nan)
+        if (not np.isfinite(mean_child)) or (not np.isfinite(mean_parent)) or (abs(mean_parent) <= FFR_MIN_BASELINE):
+            val = UNDEFINED_FILL_VALUE
+            if LOG_UNDEFINED:
+                reason = []
+                if not np.isfinite(mean_child):
+                    reason.append("child segment mean pressure not finite")
+                if not np.isfinite(mean_parent):
+                    reason.append("parent segment mean pressure not finite")
+                elif abs(mean_parent) <= FFR_MIN_BASELINE:
+                    reason.append(f"parent segment mean pressure too small (|p| ≤ {FFR_MIN_BASELINE})")
+                messages.append(f"[Segment_FFR_byPressureAverage] Segment {ch} set to {UNDEFINED_FILL_VALUE} ({'; '.join(reason)}). Parent segment {par}.")
         else:
-            val_power = (p_start - p_end) * q_start
+            val = float(mean_child / mean_parent)
+        inds = np.array(seg_to_indices.get(ch, []), dtype=int)
+        if inds.size > 0:
+            segment_ffr_by_pressure_avg[inds] = val
+            parent_branch_seg_arr[inds] = par
+        visited_segments.add(ch)
+        queue.append(ch)
 
-        # Segmental FFR (pressure ratio: end/start)
-        if np.isnan(p_start) or np.isnan(p_end) or abs(p_start) <= FFR_MIN_BASELINE:
-            val_ffr = np.nan if FFR_WRITE_NAN_WHEN_BAD_BASELINE else 0.0
-        else:
-            val_ffr = p_end / p_start
-
-        # Paint across ALL points in the segment (not just valid path points)
-        seg_inds_all = np.where(segment_id == int(s))[0]
-        segment_power_pd[seg_inds_all] = val_power
-        segmental_ffr[seg_inds_all]    = val_ffr
-
-# -----------------------------
+# --------------------------------
 # Output
-# -----------------------------
+# --------------------------------
 out = self.GetOutput()
 out.DeepCopy(poly)
 
-add_array(out, "Power_PressureDrop", power_pd)
-if segment_power_pd is not None:
-    add_array(out, "Segment_Power_PressureDrop", segment_power_pd)
-if segmental_ffr is not None:
-    add_array(out, "Segmental_FFR", segmental_ffr)
+# Existing arrays (unchanged)
+add_point_array(out, "Power_PressureDrop", power_pd)
+add_point_array(out, "Segment_Power_PressureDrop", segment_power_pd)
+add_point_array(out, "Segment_PressureAverage", segment_pressure_avg)
+add_point_array(out, "Segment_FFR_perBranch", segment_ffr_per_branch)
+
+
+# NEW: Topology-true branch arrays (authoritative)
+add_point_array(out, "z-branch_ID", z_branch_id_arr)
+add_point_array(out, "z-branch_Parent", z_branch_parent_arr)
+add_point_array(out, "Segment_FFR_byPressureAverage", z_branch_ffr_arr)
+
+# Log messages (undefined cases etc.)
+if LOG_UNDEFINED and len(messages) > 0:
+    try:
+        print("\n".join(messages))
+    except Exception:
+        pass
+    add_field_string_array(out, "BranchAndSegment_FFR_Messages", messages)
 """
 pf10.OutputDataSetType = 'vtkPolyData'
 pf10.RequestInformationScript = ''
