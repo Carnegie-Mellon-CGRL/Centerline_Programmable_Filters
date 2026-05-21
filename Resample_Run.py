@@ -1,9 +1,9 @@
 from paraview.simple import *
 import os
 
-centerlines_path = r"C:/Users/Admin/Documents/temp-2/HP5159.vtp"
-results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/HP5159/all_results_01000.vtu"
-results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/000-Simulation_Results/HP5159/all_results_01000.vtp"
+centerlines_path = r"C:/Users/Admin/Documents/Simvascular_Files/0000-Temp/0078_Short.vtp"
+results_vtu_path = r"C:/Users/Admin/Documents/Simvascular_Files/0078_H_PULM_H/Simulations/RCR/RCR-converted-results/all_results_00500.vtu"
+results_vtp_path = r"C:/Users/Admin/Documents/Simvascular_Files/0078_H_PULM_H/Simulations/RCR/RCR-converted-results/all_results_00500.vtp"
 
 # -------------------------
 # 1) Load data sources
@@ -477,11 +477,208 @@ calculator.Function = 'pressure / 1333.22'
 calculator.UpdatePipeline()
 
 # -------------------------
-# 7) Programmable Filter 5 
-# Calculates Flow, 'Power', and Resistance by Ohm's Law
+# 7) Group centerlines with the vtu to find flow
 # -------------------------
-pf5 = ProgrammableFilter(Input=[calculator])
+
+grp_pf6 = GroupDatasets(Input=[calculator, XMLUnstructuredGridReader1])
+grp_pf6.UpdatePipeline()
+
+# -------------------------
+# 8) Programmable Filter 5 
+# Calculates Flow
+# -------------------------
+
+pf5 = ProgrammableFilter(Input=[grp_pf6])
 pf5.Script = r"""
+import vtk
+import numpy as np
+from vtkmodules.util import numpy_support
+from collections import deque
+
+#--------------------------------------------------
+# Inputs
+#--------------------------------------------------
+grouped_input = inputs[0]
+centerline = grouped_input.GetBlock(0)   # .vtp
+volume = grouped_input.GetBlock(1)       # .vtu
+
+centerline_points = numpy_support.vtk_to_numpy(
+    centerline.GetPoints().GetData()
+)
+
+num_points = centerline.GetNumberOfPoints()
+
+# Required centerline arrays
+is_inlet = numpy_support.vtk_to_numpy(
+    centerline.GetPointData().GetArray("IsInlet")
+)
+is_outlet = numpy_support.vtk_to_numpy(
+    centerline.GetPointData().GetArray("IsOutlet")
+)
+
+#--------------------------------------------------
+# Build connectivity graph of the centerline
+#--------------------------------------------------
+connectivity = {i: [] for i in range(num_points)}
+
+for cid in range(centerline.GetNumberOfCells()):
+    cell = centerline.GetCell(cid)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p0 = cell.GetPointId(j)
+        p1 = cell.GetPointId(j + 1)
+        connectivity[p0].append(p1)
+        connectivity[p1].append(p0)
+
+#--------------------------------------------------
+# DFS path finder
+#--------------------------------------------------
+def find_path_dfs(connectivity, start, end):
+    stack = [(start, [start])]
+    visited = set()
+
+    while stack:
+        node, path = stack.pop()
+        if node == end:
+            return path
+        if node not in visited:
+            visited.add(node)
+            for nb in connectivity[node]:
+                if nb not in visited:
+                    stack.append((nb, path + [nb]))
+    return []
+
+#--------------------------------------------------
+# Collect all valid inlet-to-outlet points
+#--------------------------------------------------
+valid_path_points = set()
+
+inlet_ids = np.where(is_inlet == 1)[0]
+outlet_ids = np.where(is_outlet == 1)[0]
+
+for i in inlet_ids:
+    for o in outlet_ids:
+        path = find_path_dfs(connectivity, i, o)
+        valid_path_points.update(path)
+
+#--------------------------------------------------
+# Output array
+#--------------------------------------------------
+volumetric_flow_array = np.zeros(num_points)
+flow_array = np.zeros(num_points)
+
+#--------------------------------------------------
+# Main loop
+#--------------------------------------------------
+for i in valid_path_points:
+
+    origin = centerline_points[i]
+
+    # --- Estimate centerline direction ---
+    if i in connectivity and len(connectivity[i]) > 0:
+        next_id = connectivity[i][0]
+        tangent = centerline_points[next_id] - origin
+    elif i > 0:
+        tangent = origin - centerline_points[i - 1]
+    else:
+        continue
+
+    norm = np.linalg.norm(tangent)
+    if norm == 0:
+        continue
+    tangent /= norm
+
+    # --- Slice the volume ---
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(origin)
+    plane.SetNormal(tangent)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetInputData(volume)
+    cutter.SetCutFunction(plane)
+    cutter.Update()
+
+    cut_output = cutter.GetOutput()
+    if cut_output.GetNumberOfPoints() == 0:
+        continue
+
+    # --- Isolate closest connected slice ---
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(cut_output)
+    conn.SetExtractionModeToClosestPointRegion()
+    conn.SetClosestPoint(origin)
+    conn.Update()
+    slice_pd = conn.GetOutput()
+
+    if slice_pd.GetNumberOfCells() == 0:
+        continue
+
+    # --- Triangulate ---
+    triangulator = vtk.vtkTriangleFilter()
+    triangulator.SetInputData(slice_pd)
+    triangulator.Update()
+    tri_pd = triangulator.GetOutput()
+
+    # --- Velocity ---
+    vel_vtk = tri_pd.GetPointData().GetArray("velocity")
+    if vel_vtk is None:
+        continue
+
+    vel = numpy_support.vtk_to_numpy(vel_vtk)
+    pts = numpy_support.vtk_to_numpy(tri_pd.GetPoints().GetData())
+
+    # --- Surface integral ---
+    Q = 0.0
+
+    for cid in range(tri_pd.GetNumberOfCells()):
+        cell = tri_pd.GetCell(cid)
+        if cell.GetCellType() != vtk.VTK_TRIANGLE:
+            continue
+
+        ids = [cell.GetPointId(k) for k in range(3)]
+        p0, p1, p2 = pts[ids]
+
+        # Triangle area
+        area_vec = np.cross(p1 - p0, p2 - p0)
+        area = 0.5 * np.linalg.norm(area_vec)
+        if area == 0:
+            continue
+
+        # Average velocity at triangle
+        v_avg = (vel[ids[0]] + vel[ids[1]] + vel[ids[2]]) / 3.0
+
+        # Flux contribution
+        Q += np.dot(v_avg, tangent) * area
+
+    volumetric_flow_array[i] = Q
+    flow_array[i] = -volumetric_flow_array[i]
+
+#--------------------------------------------------
+# Attach output
+#--------------------------------------------------
+volumetric_flow_vtk = numpy_support.numpy_to_vtk(volumetric_flow_array)
+volumetric_flow_vtk.SetName("z-VolumetricFlowRate")
+
+flow_vtk = numpy_support.numpy_to_vtk(flow_array)
+flow_vtk.SetName("Flow")
+
+centerline.GetPointData().AddArray(volumetric_flow_vtk)
+centerline.GetPointData().AddArray(flow_vtk)
+
+output.ShallowCopy(centerline)
+"""
+pf5.OutputDataSetType = 'vtkPolyData'
+pf5.RequestInformationScript = ''
+pf5.RequestUpdateExtentScript = ''
+pf5.PythonPath = ''
+pf5.UpdatePipeline()
+
+
+# -------------------------
+# 9) Programmable Filter 6 
+# Calculates 'Power' and Resistance by Ohm's Law
+# -------------------------
+pf6 = ProgrammableFilter(Input=[pf5])
+pf6.Script = r"""
 
 import vtk
 from vtkmodules.util import numpy_support
@@ -489,7 +686,7 @@ import numpy as np
 from collections import deque
 
 # -------------------------------------------------------------------------
-# Input / Output (as requested)
+# Input / Output
 # -------------------------------------------------------------------------
 input = self.GetInputDataObject(0, 0)
 output = self.GetOutput()
@@ -504,11 +701,12 @@ num_points = poly.GetNumberOfPoints()
 pd = poly.GetPointData()
 
 filtered_area_vtk = pd.GetArray("Filtered_Area")
-blanking_vtk = pd.GetArray("Blanking")
-is_inlet_vtk = pd.GetArray("IsInlet")
-is_outlet_vtk = pd.GetArray("IsOutlet")
-velocity_vtk = pd.GetArray("velocity")
-pressure_vtk = pd.GetArray("pressure")
+blanking_vtk      = pd.GetArray("Blanking")
+is_inlet_vtk      = pd.GetArray("IsInlet")
+is_outlet_vtk     = pd.GetArray("IsOutlet")
+velocity_vtk      = pd.GetArray("velocity")
+pressure_vtk      = pd.GetArray("pressure")
+flow_vtk      = pd.GetArray("Flow")
 
 if (filtered_area_vtk is None or blanking_vtk is None or
     velocity_vtk is None or pressure_vtk is None or
@@ -525,17 +723,18 @@ is_inlet      = numpy_support.vtk_to_numpy(is_inlet_vtk)
 is_outlet     = numpy_support.vtk_to_numpy(is_outlet_vtk)
 velocity_np   = numpy_support.vtk_to_numpy(velocity_vtk)
 pressure_np   = numpy_support.vtk_to_numpy(pressure_vtk)
+flow_np = numpy_support.vtk_to_numpy(flow_vtk)
 
 # -------------------------------------------------------------------------
 # Allocate Output Arrays
 # -------------------------------------------------------------------------
-flow_array       = np.zeros(num_points)
+
 power_array      = np.zeros(num_points)
 resistance_array = np.zeros(num_points)
 normals_array    = np.zeros((num_points, 3))
 
 # -------------------------------------------------------------------------
-# Build Connectivity Graph
+# Build Connectivity Graph (UNDIRECTED)
 # -------------------------------------------------------------------------
 connectivity = {i: [] for i in range(num_points)}
 
@@ -548,116 +747,37 @@ for cell_id in range(poly.GetNumberOfCells()):
         connectivity[p2].append(p1)
 
 # -------------------------------------------------------------------------
-# BFS for inlet → outlet paths
+# Identify Valid Path Points via BFS inlet → outlet paths
 # -------------------------------------------------------------------------
-def find_path(connectivity, start, end):
+def find_path(start, end):
     visited = set()
     queue = deque([[start]])
 
     while queue:
         path = queue.popleft()
         node = path[-1]
-
         if node == end:
             return path
-
         if node not in visited:
             visited.add(node)
-            for neighbor in connectivity[node]:
-                queue.append(path + [neighbor])
-
+            for n in connectivity[node]:
+                queue.append(path + [n])
     return []
 
-# -------------------------------------------------------------------------
-# Identify Valid Path Points
-# -------------------------------------------------------------------------
 valid_path_points = set()
 inlet_indices  = np.where(is_inlet == 1)[0]
 outlet_indices = np.where(is_outlet == 1)[0]
 
 for inlet in inlet_indices:
     for outlet in outlet_indices:
-        path = find_path(connectivity, inlet, outlet)
-        valid_path_points.update(path)
+        valid_path_points.update(find_path(inlet, outlet))
 
 # -------------------------------------------------------------------------
-# Compute Flow, Power, Resistance
+# Final Power and Resistance Computation
 # -------------------------------------------------------------------------
 for i in valid_path_points:
-
-    # Estimate normal
-    if i > 0:
-        prev_point = points_np[i - 1]
-    else:
-        prev_point = points_np[i] - np.array([1.0, 0.0, 0.0])
-
-    tangent = points_np[i] - prev_point
-    norm = np.linalg.norm(tangent)
-    if norm == 0.0 or np.isnan(norm):
-        continue
-
-    normal = tangent / norm
-    normals_array[i] = normal
-
-    # Dot velocity with normal
-    v_vec = velocity_np[i]
-    v_normal = np.dot(v_vec, normal)
-
-    A = filtered_area[i]
-    if A <= 0.0:
-        continue
-
-    flow = abs(v_normal * A)
-    flow_array[i] = flow
-
-    if abs(flow) > 1e-8:
-        power_array[i] = pressure_np[i] * flow
-        resistance_array[i] = pressure_np[i] / flow
-
-# -------------------------------------------------------------------------
-# >>> SAFETY FIX: FLOW JUMP STABILIZATION <<<
-# -------------------------------------------------------------------------
-
-FLOW_JUMP_FACTOR = 10.0  # max allowed ratio between neighbors
-
-fixed_flow = flow_array.copy()
-
-for i in valid_path_points:
-
-    neighbors = connectivity[i]
-    neigh_flows = [flow_array[n] for n in neighbors if n in valid_path_points]
-
-    if len(neigh_flows) == 0:
-        continue
-
-    fi = flow_array[i]
-
-    # If any zero neighbors, handle separately
-    if fi <= 0 or min(neigh_flows) <= 0:
-        nz = [f for f in neigh_flows if f > 0]
-        if len(nz) > 0:
-            fixed_flow[i] = sum(nz) / len(nz)
-        continue
-
-    # Compute ratio
-    ratio = max( [fi] + neigh_flows ) / min( [fi] + neigh_flows )
-
-    if ratio > FLOW_JUMP_FACTOR:
-        # Physiologically impossible → smooth
-        fixed_flow[i] = float(sum(neigh_flows) / len(neigh_flows))
-
-# Replace with smoothed version
-flow_array = fixed_flow
-
-# Recompute power and resistance using smoothed flow
-for i in valid_path_points:
-    f = flow_array[i]
-    if abs(f) > 1e-8:
-        power_array[i]      = pressure_np[i] * f
-        resistance_array[i] = pressure_np[i] / f
-    else:
-        power_array[i]      = 0.0
-        resistance_array[i] = 0.0
+    power_array[i]      = pressure_np[i] * flow_np[i]
+    resistance_array[i] = pressure_np[i] / flow_np[i]
 
 # -------------------------------------------------------------------------
 # Attach Arrays
@@ -668,22 +788,22 @@ def add_array(name, np_array, num_comps=1):
     vtk_arr.SetNumberOfComponents(num_comps)
     output.GetPointData().AddArray(vtk_arr)
 
-add_array("Flow", flow_array)
 add_array("Power", power_array)
 add_array("Ohm's Law Resistance", resistance_array)
-add_array("Slice_Normal", normals_array, 3)
+
+
 """
-pf5.RequestInformationScript = ''
-pf5.RequestUpdateExtentScript = ''
-pf5.PythonPath = ''
-pf5.UpdatePipeline()
+pf6.RequestInformationScript = ''
+pf6.RequestUpdateExtentScript = ''
+pf6.PythonPath = ''
+pf6.UpdatePipeline()
 
 
 # -------------------------
 # 8) Group the result of PF5 with the original VTU
 # -------------------------
-grp_pf6 = GroupDatasets(Input=[pf5, XMLUnstructuredGridReader1])
-grp_pf6.UpdatePipeline()
+grp_pf7 = GroupDatasets(Input=[pf6, XMLUnstructuredGridReader1])
+grp_pf7.UpdatePipeline()
 
 
 
@@ -691,8 +811,8 @@ grp_pf6.UpdatePipeline()
 # 9) Programmable Filter 6 on grouped data
 # Calculates resistance based on the Poiseuille law equation
 # -------------------------
-pf6 = ProgrammableFilter(Input=[grp_pf6])
-pf6.Script = r"""
+pf7 = ProgrammableFilter(Input=[grp_pf6])
+pf7.Script = r"""
 
 import vtk
 import math
@@ -1031,18 +1151,18 @@ pd.AddArray(on_path_flag)
 output.ShallowCopy(centerline)
 
 """
-pf6.OutputDataSetType = 'vtkPolyData'
-pf6.RequestInformationScript = ''
-pf6.RequestUpdateExtentScript = ''
-pf6.PythonPath = ''
-pf6.UpdatePipeline()
+pf7.OutputDataSetType = 'vtkPolyData'
+pf7.RequestInformationScript = ''
+pf7.RequestUpdateExtentScript = ''
+pf7.PythonPath = ''
+pf7.UpdatePipeline()
 
 # -------------------------
-# 10) Programmable Filter 7
-# Calculates Resistance metrics per line segment
+# 10) Programmable Filter 8
+# Calculates segment-wise metrics, such as segmentID and segment-wise WSS
 # -------------------------
-pf7 = ProgrammableFilter(Input=[pf6])
-pf7.Script = r"""
+pf8 = ProgrammableFilter(Input=[pf7])
+pf8.Script = r"""
 import vtk
 import math
 
@@ -1339,20 +1459,20 @@ pd.AddArray(seg_wss_mean_arr)
 output.ShallowCopy(centerline)
 
 """
-pf7.OutputDataSetType = 'vtkPolyData'
-pf7.RequestInformationScript = ''
-pf7.RequestUpdateExtentScript = ''
-pf7.PythonPath = ''
-pf7.UpdatePipeline()
+pf8.OutputDataSetType = 'vtkPolyData'
+pf8.RequestInformationScript = ''
+pf8.RequestUpdateExtentScript = ''
+pf8.PythonPath = ''
+pf8.UpdatePipeline()
 
 # -------------------------
-# 11) Programmable Filter 8
+# 11) Programmable Filter 9
 # Determines which 'side' all points are aligned on.
 # Note, sidedness may not be geometrically accurate, as it simply groups points by which
 # of the LPA or RPA they come off of (and assigns null to the MPA)
 # -------------------------
-pf8 = ProgrammableFilter(Input=[pf7])
-pf8.Script = r"""
+pf9 = ProgrammableFilter(Input=[pf8])
+pf9.Script = r"""
 import vtk
 from vtkmodules.util import numpy_support
 import numpy as np
@@ -1440,18 +1560,18 @@ for i in range(num_points):
 
 output.GetPointData().AddArray(sidedness_vtk)
 """
-pf8.OutputDataSetType = 'vtkPolyData'
-pf8.RequestInformationScript = ''
-pf8.RequestUpdateExtentScript = ''
-pf8.PythonPath = ''
-pf8.UpdatePipeline()
+pf9.OutputDataSetType = 'vtkPolyData'
+pf9.RequestInformationScript = ''
+pf9.RequestUpdateExtentScript = ''
+pf9.PythonPath = ''
+pf9.UpdatePipeline()
 
 # -------------------------
-# 12) Programmable Filter 9
+# 12) Programmable Filter 10
 # Renames arrays
 # -------------------------
-pf9 = ProgrammableFilter(Input=[pf8])
-pf9.Script = r"""
+pf10 = ProgrammableFilter(Input=[pf9])
+pf10.Script = r"""
 
 from vtkmodules.util import numpy_support
 
@@ -1509,20 +1629,20 @@ for old_name, new_name in rename_map.items():
 output.ShallowCopy(input_data)
 
 """
-pf9.OutputDataSetType = 'vtkPolyData'
-pf9.RequestInformationScript = ''
-pf9.RequestUpdateExtentScript = ''
-pf9.PythonPath = ''
-pf9.UpdatePipeline()
+pf10.OutputDataSetType = 'vtkPolyData'
+pf10.RequestInformationScript = ''
+pf10.RequestUpdateExtentScript = ''
+pf10.PythonPath = ''
+pf10.UpdatePipeline()
 
 
 
 # -------------------------
-# 34) Programmable Filter 10
+# Programmable Filter 11
 # Computes power by pressure drop
 # -------------------------
-pf10 = ProgrammableFilter(Input=[pf9])
-pf10.Script = r"""
+pf11 = ProgrammableFilter(Input=[pf10])
+pf11.Script = r"""
 import vtk
 from vtkmodules.util import numpy_support
 import numpy as np
@@ -2027,8 +2147,869 @@ if LOG_UNDEFINED and len(messages) > 0:
         pass
     add_field_string_array(out, "BranchAndSegment_FFR_Messages", messages)
 """
-pf10.OutputDataSetType = 'vtkPolyData'
-pf10.RequestInformationScript = ''
-pf10.RequestUpdateExtentScript = ''
-pf10.PythonPath = ''
-pf10.UpdatePipeline()
+pf11.OutputDataSetType = 'vtkPolyData'
+pf11.RequestInformationScript = ''
+pf11.RequestUpdateExtentScript = ''
+pf11.PythonPath = ''
+pf11.UpdatePipeline()
+
+# -------------------------
+# Programmable Filter 12
+# Computes segment wise power and flow
+# -------------------------
+pf12 = ProgrammableFilter(Input=[pf11])
+pf12.Script = r"""
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# ============================================================
+# Parameters
+# ============================================================
+EPS = 1e-14
+MEDIAN_HALF_WIDTH = 5          # ±5 → total 11 points
+MEDIAN_UPSTREAM = 15           # 15 points upstream from outlet
+MIN_POINTS_PER_SEGMENT = 20    # <= THIS disables short segments
+
+# ============================================================
+# Input
+# ============================================================
+poly = self.GetInputDataObject(0, 0)
+pd = poly.GetPointData()
+num_points = poly.GetNumberOfPoints()
+
+# ============================================================
+# Required arrays
+# ============================================================
+pressure   = numpy_support.vtk_to_numpy(pd.GetArray("pressure")).astype(float)
+segment_id = numpy_support.vtk_to_numpy(pd.GetArray("segment_ID")).astype(np.int64)
+flow       = numpy_support.vtk_to_numpy(pd.GetArray("Flow")).astype(float)
+is_inlet   = numpy_support.vtk_to_numpy(pd.GetArray("IsInlet")).astype(int)
+
+zclip_vtk = pd.GetArray("z-clipping_Flag")
+if zclip_vtk:
+    zclip = numpy_support.vtk_to_numpy(zclip_vtk).astype(int)
+else:
+    zclip = np.zeros(num_points, dtype=int)
+
+# Writable output version of segment_ID
+segment_id_out = segment_id.astype(float).copy()
+
+# ============================================================
+# Connectivity
+# ============================================================
+def build_connectivity(polydata):
+    adj = {}
+    for i in range(num_points):
+        adj[i] = []
+
+    for cid in range(polydata.GetNumberOfCells()):
+        cell = polydata.GetCell(cid)
+        npts = cell.GetNumberOfPoints()
+        for j in range(npts - 1):
+            a = cell.GetPointId(j)
+            b = cell.GetPointId(j + 1)
+            adj[a].append(b)
+            adj[b].append(a)
+    return adj
+
+adj = build_connectivity(poly)
+
+# ============================================================
+# BFS from inlets → parent + distance
+# ============================================================
+def bfs(start_pts):
+    parent = np.full(num_points, -1, dtype=int)
+    dist   = np.full(num_points, np.inf)
+
+    q = deque()
+    for s in start_pts:
+        s = int(s)
+        dist[s] = 0
+        q.append(s)
+
+    while q:
+        u = q.popleft()
+        for v in adj[u]:
+            if np.isinf(dist[v]):
+                parent[v] = u
+                dist[v] = dist[u] + 1
+                q.append(v)
+
+    return parent, dist
+
+parent, dist = bfs(np.where(is_inlet == 1)[0])
+
+# ============================================================
+# Segment indexing
+# ============================================================
+unique_segments = np.unique(segment_id)
+
+seg_to_inds = {}
+for s in unique_segments:
+    seg_to_inds[int(s)] = []
+for i in range(num_points):
+    seg_to_inds[int(segment_id[i])].append(i)
+
+# ============================================================
+# Output arrays
+# ============================================================
+seg_flow_median      = np.zeros(num_points)
+seg_flow_median_avg  = np.zeros(num_points)
+power_median         = np.zeros(num_points)
+power_median_avg     = np.zeros(num_points)
+is_median_point      = np.zeros(num_points, dtype=int)
+
+# ============================================================
+# Per‑segment computation
+# ============================================================
+for s in unique_segments:
+    s = int(s)
+    inds = seg_to_inds[s]
+
+    # --------------------------------------------------------
+    # invalidate short segments
+    # --------------------------------------------------------
+    if len(inds) <= MIN_POINTS_PER_SEGMENT:
+        for i in inds:
+            segment_id_out[i] = np.nan
+        continue
+
+    # ---------------- Find inlet / outlet via tree distance ----------------
+    inlet = None
+    outlet = None
+
+    for i in inds:
+        if not np.isfinite(dist[i]):
+            continue
+        if inlet is None or dist[i] < dist[inlet]:
+            inlet = i
+        if outlet is None or dist[i] > dist[outlet]:
+            outlet = i
+
+    if inlet is None or outlet is None:
+        continue
+
+    if not np.isfinite(pressure[inlet]) or not np.isfinite(pressure[outlet]):
+        continue
+
+    dp = pressure[inlet] - pressure[outlet]
+
+    # ---------------- Tree‑ordered path ----------------
+    path = []
+    cur = outlet
+    while cur != -1 and segment_id[cur] == s:
+        path.append(cur)
+        cur = parent[cur]
+    path.reverse()
+
+    if len(path) == 0:
+        continue
+
+    # ---------------- Median = 15 upstream ----------------
+    median_index = len(path) - 1 - MEDIAN_UPSTREAM
+    if median_index < 0:
+        median_index = 0
+
+    median_pid = path[median_index]
+    is_median_point[median_pid] = 1
+
+    q_med_single = flow[median_pid] if np.isfinite(flow[median_pid]) else 0.0
+    p_med_single = dp * q_med_single
+
+    # ---------------- Median ±5 window ----------------
+    w0 = median_index - MEDIAN_HALF_WIDTH
+    if w0 < 0:
+        w0 = 0
+    w1 = median_index + MEDIAN_HALF_WIDTH + 1
+    if w1 > len(path):
+        w1 = len(path)
+
+    window_flows = []
+    for pid in path[w0:w1]:
+        if zclip[pid] != 1 and np.isfinite(flow[pid]):
+            window_flows.append(flow[pid])
+
+    if not window_flows:
+        for pid in path[w0:w1]:
+            if np.isfinite(flow[pid]):
+                window_flows.append(flow[pid])
+
+    q_med_avg = np.mean(window_flows) if window_flows else q_med_single
+    if abs(q_med_avg) <= EPS:
+        q_med_avg = q_med_single
+
+    p_med_avg = dp * q_med_avg
+
+    for i in inds:
+        seg_flow_median[i]     = q_med_single
+        seg_flow_median_avg[i] = q_med_avg
+        power_median[i]        = p_med_single
+        power_median_avg[i]    = p_med_avg
+
+# ============================================================
+# Output
+# ============================================================
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+def add_array(name, arr):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    out.GetPointData().AddArray(vtk_arr)
+
+add_array("segment_ID", segment_id_out)
+add_array("Segment-Flow_offset_outlet", seg_flow_median_avg)
+add_array("Segment-Power_flow_offset_outlet", power_median)
+add_array("Segment-Power_flow_offset_outlet_average", power_median_avg)
+add_array("IsMedianPoint", is_median_point)
+"""
+pf12.OutputDataSetType = 'vtkPolyData'
+pf12.RequestInformationScript = ''
+pf12.RequestUpdateExtentScript = ''
+pf12.PythonPath = ''
+pf12.UpdatePipeline()
+
+# -------------------------
+# Programmable Filter 13
+# Deletes extra arrays
+# -------------------------
+pf13 = ProgrammableFilter(Input=[pf12])
+pf13.Script = r"""
+
+from vtkmodules.util import numpy_support
+
+# Input
+polydata = self.GetInput()
+
+# List of array names to remove
+arrays_to_remove = ["Segment-Flow_Inlet", "Segment-Flow_Median","Segment-Flow_MedianAverage","Segment-Flow_Outlet","Segment-Power_UsingMedian","Segment-Power_UsingMedianAverage","average_pressure", "average_speed", "capPoints", "centerlineIds", "filtered_Radius_Initial", "globalElementID", "globalNodeID", "groupIds", "onAnyPathFlag","pathOrder","power_byPressuresValuePerPoint",
+"segment_LowerQuartile_AvgRadius","segment_Power_Average","slice_Normal","sphereRadius","timeDeriv","tractIds","vWSS","vinplane_traction","vtkValidPointMask","z-branch_FFR","z-branch_Id","z-branch_Parent","z-extra_FFR","z-extra_Outlet_ID","z-branch_ID"]  # <-- Add array names here, e.g., ["FilteredRadius", "WrongRadius"]
+
+# Remove specified arrays from PointData
+point_data = polydata.GetPointData()
+for name in arrays_to_remove:
+    if point_data.HasArray(name):
+        point_data.RemoveArray(name)
+
+# Output
+output.ShallowCopy(polydata)
+
+"""
+pf13.OutputDataSetType = 'vtkPolyData'
+pf13.RequestInformationScript = ''
+pf13.RequestUpdateExtentScript = ''
+pf13.PythonPath = ''
+pf13.UpdatePipeline()
+
+# -------------------------
+# Programmable Filter 14
+# Threshold FFR
+# -------------------------
+pf14 = ProgrammableFilter(Input=[pf13])
+pf14.Script = r"""
+
+
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+import math
+
+# --------------------------------
+# Parameters / Toggles
+# --------------------------------
+USE_BLANKING = False           # include all points; do not gate by Blanking
+VALID_BLANKING_VALUE = 0       # unused when USE_BLANKING is False
+
+EPS = 1e-14
+FLOW_EPS = 1e-14               # optional tiny threshold for near-zero flow handling
+FFR_MIN_BASELINE = 1e-12       # guard for division in FFR
+UNDEFINED_FILL_VALUE = 1.0     # sentinel used elsewhere for undefined FFR
+LOG_UNDEFINED = True
+
+# Threshold for segment flagging
+THRESHOLD_FFR = 0.8
+
+# --------------------------------
+# Input (PolyData)
+# --------------------------------
+poly = self.GetInputDataObject(0, 0)
+if poly is None or poly.GetPoints() is None:
+    raise RuntimeError("No input on port 0 or input has no points.")
+
+num_points = poly.GetNumberOfPoints()
+pd = poly.GetPointData()
+
+# --------------------------------
+# Required arrays
+# --------------------------------
+is_inlet_vtk  = pd.GetArray("IsInlet")
+is_outlet_vtk = pd.GetArray("IsOutlet")
+ffr_vtk       = pd.GetArray("Segment_FFR_byPressureAverage")
+segment_vtk   = pd.GetArray("segment_ID")  # existing segment IDs
+
+missing = []
+if is_inlet_vtk is None:  missing.append("IsInlet")
+if is_outlet_vtk is None: missing.append("IsOutlet")
+if ffr_vtk is None:       missing.append("Segment_FFR_byPressureAverage")
+if segment_vtk is None:   missing.append("segment_ID")
+if missing:
+    raise RuntimeError("Missing required array(s): " + ", ".join(missing))
+
+# --------------------------------
+# NumPy views
+# --------------------------------
+points_np  = numpy_support.vtk_to_numpy(poly.GetPoints().GetData()).astype(float, copy=False)
+is_inlet   = numpy_support.vtk_to_numpy(is_inlet_vtk).astype(int, copy=False)
+is_outlet  = numpy_support.vtk_to_numpy(is_outlet_vtk).astype(int, copy=False)
+ffr_vals   = numpy_support.vtk_to_numpy(ffr_vtk).astype(float, copy=False)
+segment_id = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False)
+
+# --------------------------------
+# Helpers
+# --------------------------------
+def add_point_array(out_poly, name, arr, num_comps=1):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    vtk_arr.SetNumberOfComponents(num_comps)
+    out_poly.GetPointData().AddArray(vtk_arr)
+
+def add_field_string_array(out_poly, name, messages):
+    if not messages:
+        return
+    sa = vtk.vtkStringArray()
+    sa.SetName(name)
+    for m in messages:
+        sa.InsertNextValue(m)
+    out_poly.GetFieldData().AddArray(sa)
+
+# --------------------------------
+# Segment-level setup
+# --------------------------------
+unique_segments = np.unique(segment_id)
+seg_to_indices = {int(s): [] for s in unique_segments}
+for i in range(num_points):
+    seg_to_indices[int(segment_id[i])].append(i)
+
+# Output array: 1 if segment FFR < 0.8, else 0 (painted to points)
+threshold_ffr_arr = np.zeros(num_points, dtype=np.int32)
+
+messages = []
+
+# --------------------------------
+# Compute per-segment threshold flags
+# --------------------------------
+for s in unique_segments:
+    s_int = int(s)
+    inds = seg_to_indices.get(s_int, [])
+    if not inds:
+        continue
+
+    # Extract FFR values for this segment
+    seg_ffr = np.array([ffr_vals[i] for i in inds], dtype=float)
+    finite_mask = np.isfinite(seg_ffr)
+
+    # Strategy: use the first finite value (arrays are typically constant per segment)
+    if np.any(finite_mask):
+        # Option A (default): first finite
+        seg_value = float(seg_ffr[finite_mask][0])
+
+        # Option B (alternate): mean over finite values
+        # seg_value = float(np.mean(seg_ffr[finite_mask]))
+    else:
+        seg_value = np.nan
+
+    # Decide flag: 1 if (finite and < threshold); otherwise 0
+    if np.isfinite(seg_value) and (seg_value < THRESHOLD_FFR):
+        flag = 1
+    else:
+        flag = 0
+
+    # Paint to all points in the segment
+    threshold_ffr_arr[np.array(inds, dtype=int)] = flag
+
+    # Optional message logging for undefined or edge cases
+    if not np.isfinite(seg_value):
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: no finite Segment_FFR_byPressureAverage; set flag=0.")
+    elif seg_value == UNDEFINED_FILL_VALUE:
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: Segment_FFR_byPressureAverage equals UNDEFINED_FILL_VALUE ({UNDEFINED_FILL_VALUE}); set flag=0.")
+    elif seg_value < THRESHOLD_FFR:
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: FFR={seg_value:.4f} < {THRESHOLD_FFR}; set flag=1.")
+    else:
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: FFR={seg_value:.4f} >= {THRESHOLD_FFR}; set flag=0.")
+
+# --------------------------------
+# Output
+# --------------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+# Segment-level threshold array (painted to points)
+add_point_array(out, "Threshold_FFR_0.8", threshold_ffr_arr)
+
+# Optional: keep a log of decisions
+if LOG_UNDEFINED and len(messages) > 0:
+    try:
+        print("\n".join(messages))
+    except Exception:
+        pass
+    add_field_string_array(out, "Threshold_FFR_0.8_Messages", messages)
+"""
+pf14.OutputDataSetType = 'vtkPolyData'
+pf14.RequestInformationScript = ''
+pf14.RequestUpdateExtentScript = ''
+pf14.PythonPath = ''
+pf14.UpdatePipeline()
+
+
+# -------------------------
+# Programmable Filter 15
+# Threshold FFR by 0.9
+# -------------------------
+pf15 = ProgrammableFilter(Input=[pf14])
+pf15.Script = r"""
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+import math
+
+# --------------------------------
+# Parameters / Toggles
+# --------------------------------
+USE_BLANKING = False           # include all points; do not gate by Blanking
+VALID_BLANKING_VALUE = 0       # unused when USE_BLANKING is False
+
+EPS = 1e-14
+FLOW_EPS = 1e-14               # optional tiny threshold for near-zero flow handling
+FFR_MIN_BASELINE = 1e-12       # guard for division in FFR
+UNDEFINED_FILL_VALUE = 1.0     # sentinel used elsewhere for undefined FFR
+LOG_UNDEFINED = True
+
+# Threshold for segment flagging
+THRESHOLD_FFR = 0.9
+
+# --------------------------------
+# Input (PolyData)
+# --------------------------------
+poly = self.GetInputDataObject(0, 0)
+if poly is None or poly.GetPoints() is None:
+    raise RuntimeError("No input on port 0 or input has no points.")
+
+num_points = poly.GetNumberOfPoints()
+pd = poly.GetPointData()
+
+# --------------------------------
+# Required arrays
+# --------------------------------
+is_inlet_vtk  = pd.GetArray("IsInlet")
+is_outlet_vtk = pd.GetArray("IsOutlet")
+ffr_vtk       = pd.GetArray("Segment_FFR_byPressureAverage")
+segment_vtk   = pd.GetArray("segment_ID")  # existing segment IDs
+
+missing = []
+if is_inlet_vtk is None:  missing.append("IsInlet")
+if is_outlet_vtk is None: missing.append("IsOutlet")
+if ffr_vtk is None:       missing.append("Segment_FFR_byPressureAverage")
+if segment_vtk is None:   missing.append("segment_ID")
+if missing:
+    raise RuntimeError("Missing required array(s): " + ", ".join(missing))
+
+# --------------------------------
+# NumPy views
+# --------------------------------
+points_np  = numpy_support.vtk_to_numpy(poly.GetPoints().GetData()).astype(float, copy=False)
+is_inlet   = numpy_support.vtk_to_numpy(is_inlet_vtk).astype(int, copy=False)
+is_outlet  = numpy_support.vtk_to_numpy(is_outlet_vtk).astype(int, copy=False)
+ffr_vals   = numpy_support.vtk_to_numpy(ffr_vtk).astype(float, copy=False)
+segment_id = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False)
+
+# --------------------------------
+# Helpers
+# --------------------------------
+def add_point_array(out_poly, name, arr, num_comps=1):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    vtk_arr.SetNumberOfComponents(num_comps)
+    out_poly.GetPointData().AddArray(vtk_arr)
+
+def add_field_string_array(out_poly, name, messages):
+    if not messages:
+        return
+    sa = vtk.vtkStringArray()
+    sa.SetName(name)
+    for m in messages:
+        sa.InsertNextValue(m)
+    out_poly.GetFieldData().AddArray(sa)
+
+# --------------------------------
+# Segment-level setup
+# --------------------------------
+unique_segments = np.unique(segment_id)
+seg_to_indices = {int(s): [] for s in unique_segments}
+for i in range(num_points):
+    seg_to_indices[int(segment_id[i])].append(i)
+
+# Output array: 1 if segment FFR < 0.8, else 0 (painted to points)
+threshold_ffr_arr = np.zeros(num_points, dtype=np.int32)
+
+messages = []
+
+# --------------------------------
+# Compute per-segment threshold flags
+# --------------------------------
+for s in unique_segments:
+    s_int = int(s)
+    inds = seg_to_indices.get(s_int, [])
+    if not inds:
+        continue
+
+    # Extract FFR values for this segment
+    seg_ffr = np.array([ffr_vals[i] for i in inds], dtype=float)
+    finite_mask = np.isfinite(seg_ffr)
+
+    # Strategy: use the first finite value (arrays are typically constant per segment)
+    if np.any(finite_mask):
+        # Option A (default): first finite
+        seg_value = float(seg_ffr[finite_mask][0])
+
+        # Option B (alternate): mean over finite values
+        # seg_value = float(np.mean(seg_ffr[finite_mask]))
+    else:
+        seg_value = np.nan
+
+    # Decide flag: 1 if (finite and < threshold); otherwise 0
+    if np.isfinite(seg_value) and (seg_value < THRESHOLD_FFR):
+        flag = 1
+    else:
+        flag = 0
+
+    # Paint to all points in the segment
+    threshold_ffr_arr[np.array(inds, dtype=int)] = flag
+
+    # Optional message logging for undefined or edge cases
+    if not np.isfinite(seg_value):
+        messages.append(f"[Threshold_FFR_0.9] Segment {s_int}: no finite Segment_FFR_byPressureAverage; set flag=0.")
+    elif seg_value == UNDEFINED_FILL_VALUE:
+        messages.append(f"[Threshold_FFR_0.9] Segment {s_int}: Segment_FFR_byPressureAverage equals UNDEFINED_FILL_VALUE ({UNDEFINED_FILL_VALUE}); set flag=0.")
+    elif seg_value < THRESHOLD_FFR:
+        messages.append(f"[Threshold_FFR_0.9] Segment {s_int}: FFR={seg_value:.4f} < {THRESHOLD_FFR}; set flag=1.")
+    else:
+        messages.append(f"[Threshold_FFR_0.9] Segment {s_int}: FFR={seg_value:.4f} >= {THRESHOLD_FFR}; set flag=0.")
+
+# --------------------------------
+# Output
+# --------------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+# Segment-level threshold array (painted to points)
+add_point_array(out, "Threshold_FFR_0.9", threshold_ffr_arr)
+
+# Optional: keep a log of decisions
+if LOG_UNDEFINED and len(messages) > 0:
+    try:
+        print("\n".join(messages))
+    except Exception:
+        pass
+    add_field_string_array(out, "Threshold_FFR_0.9_Messages", messages)
+"""
+pf15.OutputDataSetType = 'vtkPolyData'
+pf15.RequestInformationScript = ''
+pf15.RequestUpdateExtentScript = ''
+pf15.PythonPath = ''
+pf15.UpdatePipeline()
+
+# -------------------------
+# Programmable Filter 16
+# Threshold Power
+# -------------------------
+pf16 = ProgrammableFilter(Input=[pf15])
+pf16.Script = r"""
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+
+# --------------------------------
+# Parameters / Toggles
+# --------------------------------
+EPS = 1e-14
+LOG_MESSAGES = True
+
+quartile_75 = 2354.006981  # Replace this value
+
+# --------------------------------
+# Input (PolyData)
+# --------------------------------
+poly = self.GetInputDataObject(0, 0)
+if poly is None or poly.GetPoints() is None:
+    raise RuntimeError("No input on port 0 or input has no points.")
+
+num_points = poly.GetNumberOfPoints()
+pd = poly.GetPointData()
+
+# --------------------------------
+# Required arrays
+# --------------------------------
+power_vtk   = pd.GetArray("Segment-Power_flow_offset_outlet_average")
+segment_vtk = pd.GetArray("segment_ID")
+
+missing = []
+if power_vtk is None:   missing.append("Segment-Power_flow_offset_outlet_average")
+if segment_vtk is None: missing.append("segment_ID")
+
+if missing:
+    raise RuntimeError("Missing required array(s): " + ", ".join(missing))
+
+# --------------------------------
+# NumPy views
+# --------------------------------
+power_vals = numpy_support.vtk_to_numpy(power_vtk).astype(float, copy=False)
+segment_id = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False)
+
+# --------------------------------
+# Helpers
+# --------------------------------
+def add_point_array(out_poly, name, arr, num_comps=1):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    vtk_arr.SetNumberOfComponents(num_comps)
+    out_poly.GetPointData().AddArray(vtk_arr)
+
+def add_field_string_array(out_poly, name, messages):
+    if not messages:
+        return
+    sa = vtk.vtkStringArray()
+    sa.SetName(name)
+    for m in messages:
+        sa.InsertNextValue(m)
+    out_poly.GetFieldData().AddArray(sa)
+
+# --------------------------------
+# Segment-level grouping
+# --------------------------------
+unique_segments = np.unique(segment_id)
+seg_to_indices = {int(s): [] for s in unique_segments}
+
+for i in range(num_points):
+    seg_to_indices[int(segment_id[i])].append(i)
+
+# --------------------------------
+# Compute segment-level power values
+# --------------------------------
+segment_values = {}
+messages = []
+
+for s in unique_segments:
+    s_int = int(s)
+    inds = seg_to_indices.get(s_int, [])
+
+    if not inds:
+        continue
+
+    seg_power = np.array([power_vals[i] for i in inds], dtype=float)
+    finite_mask = np.isfinite(seg_power)
+
+    if np.any(finite_mask):
+        # Use first finite value (consistent with your prior logic)
+        seg_value = float(seg_power[finite_mask][0])
+
+        # Alternative (more robust):
+        # seg_value = float(np.mean(seg_power[finite_mask]))
+    else:
+        seg_value = np.nan
+
+    segment_values[s_int] = seg_value
+
+    if not np.isfinite(seg_value):
+        messages.append(f"[Power Quartile] Segment {s_int}: no finite values.")
+
+# --------------------------------
+# Compute 75th percentile threshold
+# --------------------------------
+all_values = np.array(
+    [v for v in segment_values.values() if np.isfinite(v)],
+    dtype=float
+)
+
+if len(all_values) == 0:
+    raise RuntimeError("No finite segment power values found.")
+
+
+
+messages.append(f"[Power Quartile] 75th percentile threshold = {quartile_75:.6e}")
+
+# --------------------------------
+# Assign flags to segments
+# --------------------------------
+threshold_arr = np.zeros(num_points, dtype=np.int32)
+num = 0
+
+for s in unique_segments:
+    s_int = int(s)
+    inds = seg_to_indices.get(s_int, [])
+    seg_value = segment_values.get(s_int, np.nan)
+
+    if np.isfinite(seg_value) and seg_value >= quartile_75:
+        flag = 1
+        messages.append(f"[Power Quartile] Segment {s_int}: {seg_value:.6e} >= threshold → 1")
+        num = num+1
+    else:
+        flag = 0
+        if np.isfinite(seg_value):
+            messages.append(f"[Power Quartile] Segment {s_int}: {seg_value:.6e} < threshold → 0")
+        else:
+            messages.append(f"[Power Quartile] Segment {s_int}: undefined → 0")
+
+    threshold_arr[np.array(inds, dtype=int)] = flag
+
+
+
+# --------------------------------
+# Output
+# --------------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+add_point_array(out, "Threshold_Power_highestMulti-modelQuartile", threshold_arr)
+
+# Optional logging
+if LOG_MESSAGES and len(messages) > 0:
+    try:
+        print("\n".join(messages))
+    except Exception:
+        pass
+    add_field_string_array(out, "Threshold_Power_highestMulti-modelQuartile", messages)
+print("number above threshold: ", num)
+"""
+pf16.OutputDataSetType = 'vtkPolyData'
+pf16.RequestInformationScript = ''
+pf16.RequestUpdateExtentScript = ''
+pf16.PythonPath = ''
+pf16.UpdatePipeline()
+
+# -------------------------
+# Programmable Filter 17
+# Threshold overlap of power and FFR
+# -------------------------
+pf17 = ProgrammableFilter(Input=[pf16])
+pf17.Script = r"""
+import numpy as np
+from collections import defaultdict
+
+# --------------------------------
+# USER PARAMETER
+# --------------------------------
+POWER_THRESHOLD = 7186.239381    #  EDIT THIS VALUE
+
+# --------------------------------
+# Get input
+# --------------------------------
+input0 = self.GetInputDataObject(0, 0)
+pd = input0.GetPointData()
+n_pts = input0.GetNumberOfPoints()
+
+# --------------------------------
+# Arrays
+# --------------------------------
+segment_ids = pd.GetArray("segment_ID")
+ffr_array   = pd.GetArray("Threshold_FFR_0.8")
+power_array = pd.GetArray("Segment-Power_flow_offset_outlet_average")
+
+if segment_ids is None or ffr_array is None or power_array is None:
+    raise RuntimeError("Missing required arrays.")
+
+# --------------------------------
+# Convert to numpy (SAFE explicit)
+# --------------------------------
+seg   = np.array([segment_ids.GetValue(i) for i in range(n_pts)])
+ffr   = np.array([ffr_array.GetValue(i) for i in range(n_pts)])
+power = np.array([power_array.GetValue(i) for i in range(n_pts)])
+
+# --------------------------------
+# Segment aggregation
+# --------------------------------
+segment_data = defaultdict(lambda: {"ffr": 0, "power": 0})
+
+for i in range(n_pts):
+    s = seg[i]
+
+    if not np.isfinite(s):
+        continue
+
+    # FFR condition
+    if ffr[i] == 1:
+        segment_data[s]["ffr"] = 1
+
+    # Power threshold condition
+    if power[i] >= POWER_THRESHOLD:
+        segment_data[s]["power"] = 1
+
+# --------------------------------
+# Counts
+# --------------------------------
+total_segments = len(segment_data)
+
+ffr_count = 0
+power_count = 0
+both_count = 0
+
+for s in segment_data:
+    f = segment_data[s]["ffr"]
+    p = segment_data[s]["power"]
+
+    if f == 1:
+        ffr_count += 1
+    if p == 1:
+        power_count += 1
+    if f == 1 and p == 1:
+        both_count += 1
+
+# --------------------------------
+# Create output array (paint segments)
+# --------------------------------
+overlap = np.zeros(n_pts, dtype=np.int32)
+
+for i in range(n_pts):
+    s = seg[i]
+
+    if not np.isfinite(s):
+        overlap[i] = 0
+        continue
+
+    data = segment_data[s]
+
+    if data["ffr"] == 1 and data["power"] == 1:
+        overlap[i] = 1
+    else:
+        overlap[i] = 0
+
+# --------------------------------
+# Print summary
+# --------------------------------
+print(
+    f"FFR Threshold = {ffr_count} segments, "
+    f"Power Threshold = {power_count} segments, "
+    f"Overlap = {both_count} segments"
+)
+
+# --------------------------------
+# Add array to output
+# --------------------------------
+import vtk
+from vtkmodules.util import numpy_support
+
+out = self.GetOutput()
+out.DeepCopy(input0)
+
+vtk_arr = numpy_support.numpy_to_vtk(overlap, deep=1)
+vtk_arr.SetName("Threshold_FFR0.8_Power_Overlap")
+out.GetPointData().AddArray(vtk_arr)
+"""
+pf17.OutputDataSetType = 'vtkPolyData'
+pf17.RequestInformationScript = ''
+pf17.RequestUpdateExtentScript = ''
+pf17.PythonPath = ''
+pf17.UpdatePipeline()
