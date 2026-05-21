@@ -650,7 +650,7 @@ for i in valid_path_points:
         Q += np.dot(v_avg, tangent) * area
 
     volumetric_flow_array[i] = Q
-    flow_array[i] = -volumetric_flow_array[i]
+    flow_array[i] = abs(volumetric_flow_array[i])
 
 #--------------------------------------------------
 # Attach output
