@@ -1,0 +1,205 @@
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+
+# ============================================================
+# Parameters
+# ============================================================
+EPS = 1e-14
+MEDIAN_HALF_WIDTH = 5          # ±5 → total 11 points
+MEDIAN_UPSTREAM = 15           # 15 points upstream from outlet
+MIN_POINTS_PER_SEGMENT = 20    # <= THIS disables short segments
+
+# ============================================================
+# Input
+# ============================================================
+poly = self.GetInputDataObject(0, 0)
+pd = poly.GetPointData()
+num_points = poly.GetNumberOfPoints()
+
+# ============================================================
+# Required arrays
+# ============================================================
+pressure   = numpy_support.vtk_to_numpy(pd.GetArray("pressure")).astype(float)
+segment_id = numpy_support.vtk_to_numpy(pd.GetArray("segment_ID")).astype(np.int64)
+flow       = numpy_support.vtk_to_numpy(pd.GetArray("Flow")).astype(float)
+is_inlet   = numpy_support.vtk_to_numpy(pd.GetArray("IsInlet")).astype(int)
+
+zclip_vtk = pd.GetArray("z-clipping_Flag")
+if zclip_vtk:
+    zclip = numpy_support.vtk_to_numpy(zclip_vtk).astype(int)
+else:
+    zclip = np.zeros(num_points, dtype=int)
+
+# Writable output version of segment_ID
+segment_id_out = segment_id.astype(float).copy()
+
+# ============================================================
+# Connectivity
+# ============================================================
+def build_connectivity(polydata):
+    adj = {}
+    for i in range(num_points):
+        adj[i] = []
+
+    for cid in range(polydata.GetNumberOfCells()):
+        cell = polydata.GetCell(cid)
+        npts = cell.GetNumberOfPoints()
+        for j in range(npts - 1):
+            a = cell.GetPointId(j)
+            b = cell.GetPointId(j + 1)
+            adj[a].append(b)
+            adj[b].append(a)
+    return adj
+
+adj = build_connectivity(poly)
+
+# ============================================================
+# BFS from inlets → parent + distance
+# ============================================================
+def bfs(start_pts):
+    parent = np.full(num_points, -1, dtype=int)
+    dist   = np.full(num_points, np.inf)
+
+    q = deque()
+    for s in start_pts:
+        s = int(s)
+        dist[s] = 0
+        q.append(s)
+
+    while q:
+        u = q.popleft()
+        for v in adj[u]:
+            if np.isinf(dist[v]):
+                parent[v] = u
+                dist[v] = dist[u] + 1
+                q.append(v)
+
+    return parent, dist
+
+parent, dist = bfs(np.where(is_inlet == 1)[0])
+
+# ============================================================
+# Segment indexing
+# ============================================================
+unique_segments = np.unique(segment_id)
+
+seg_to_inds = {}
+for s in unique_segments:
+    seg_to_inds[int(s)] = []
+for i in range(num_points):
+    seg_to_inds[int(segment_id[i])].append(i)
+
+# ============================================================
+# Output arrays
+# ============================================================
+seg_flow_median      = np.zeros(num_points)
+seg_flow_median_avg  = np.zeros(num_points)
+power_median         = np.zeros(num_points)
+power_median_avg     = np.zeros(num_points)
+is_median_point      = np.zeros(num_points, dtype=int)
+
+# ============================================================
+# Per‑segment computation
+# ============================================================
+for s in unique_segments:
+    s = int(s)
+    inds = seg_to_inds[s]
+
+    # --------------------------------------------------------
+    # invalidate short segments
+    # --------------------------------------------------------
+    if len(inds) <= MIN_POINTS_PER_SEGMENT:
+        for i in inds:
+            segment_id_out[i] = np.nan
+        continue
+
+    # ---------------- Find inlet / outlet via tree distance ----------------
+    inlet = None
+    outlet = None
+
+    for i in inds:
+        if not np.isfinite(dist[i]):
+            continue
+        if inlet is None or dist[i] < dist[inlet]:
+            inlet = i
+        if outlet is None or dist[i] > dist[outlet]:
+            outlet = i
+
+    if inlet is None or outlet is None:
+        continue
+
+    if not np.isfinite(pressure[inlet]) or not np.isfinite(pressure[outlet]):
+        continue
+
+    dp = pressure[inlet] - pressure[outlet]
+
+    # ---------------- Tree‑ordered path ----------------
+    path = []
+    cur = outlet
+    while cur != -1 and segment_id[cur] == s:
+        path.append(cur)
+        cur = parent[cur]
+    path.reverse()
+
+    if len(path) == 0:
+        continue
+
+    # ---------------- Median = 15 upstream ----------------
+    median_index = len(path) - 1 - MEDIAN_UPSTREAM
+    if median_index < 0:
+        median_index = 0
+
+    median_pid = path[median_index]
+    is_median_point[median_pid] = 1
+
+    q_med_single = flow[median_pid] if np.isfinite(flow[median_pid]) else 0.0
+    p_med_single = dp * q_med_single
+
+    # ---------------- Median ±5 window ----------------
+    w0 = median_index - MEDIAN_HALF_WIDTH
+    if w0 < 0:
+        w0 = 0
+    w1 = median_index + MEDIAN_HALF_WIDTH + 1
+    if w1 > len(path):
+        w1 = len(path)
+
+    window_flows = []
+    for pid in path[w0:w1]:
+        if zclip[pid] != 1 and np.isfinite(flow[pid]):
+            window_flows.append(flow[pid])
+
+    if not window_flows:
+        for pid in path[w0:w1]:
+            if np.isfinite(flow[pid]):
+                window_flows.append(flow[pid])
+
+    q_med_avg = np.mean(window_flows) if window_flows else q_med_single
+    if abs(q_med_avg) <= EPS:
+        q_med_avg = q_med_single
+
+    p_med_avg = dp * q_med_avg
+
+    for i in inds:
+        seg_flow_median[i]     = q_med_single
+        seg_flow_median_avg[i] = q_med_avg
+        power_median[i]        = p_med_single
+        power_median_avg[i]    = p_med_avg
+
+# ============================================================
+# Output
+# ============================================================
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+def add_array(name, arr):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    out.GetPointData().AddArray(vtk_arr)
+
+add_array("segment_ID", segment_id_out)
+add_array("Segment-Flow_offset_outlet", seg_flow_median_avg)
+add_array("Segment-Power_flow_offset_outlet", power_median)
+add_array("Segment-Power_flow_offset_outlet_average", power_median_avg)
+add_array("IsMedianPoint", is_median_point)

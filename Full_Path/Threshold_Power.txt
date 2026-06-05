@@ -1,0 +1,155 @@
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+
+# --------------------------------
+# Parameters / Toggles
+# --------------------------------
+EPS = 1e-14
+LOG_MESSAGES = True
+
+quartile_75 = 2354.006981  # Replace this value
+
+# --------------------------------
+# Input (PolyData)
+# --------------------------------
+poly = self.GetInputDataObject(0, 0)
+if poly is None or poly.GetPoints() is None:
+    raise RuntimeError("No input on port 0 or input has no points.")
+
+num_points = poly.GetNumberOfPoints()
+pd = poly.GetPointData()
+
+# --------------------------------
+# Required arrays
+# --------------------------------
+power_vtk   = pd.GetArray("Segment-Power_flow_offset_outlet_average")
+segment_vtk = pd.GetArray("segment_ID")
+
+missing = []
+if power_vtk is None:   missing.append("Segment-Power_flow_offset_outlet_average")
+if segment_vtk is None: missing.append("segment_ID")
+
+if missing:
+    raise RuntimeError("Missing required array(s): " + ", ".join(missing))
+
+# --------------------------------
+# NumPy views
+# --------------------------------
+power_vals = numpy_support.vtk_to_numpy(power_vtk).astype(float, copy=False)
+segment_id = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False)
+
+# --------------------------------
+# Helpers
+# --------------------------------
+def add_point_array(out_poly, name, arr, num_comps=1):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    vtk_arr.SetNumberOfComponents(num_comps)
+    out_poly.GetPointData().AddArray(vtk_arr)
+
+def add_field_string_array(out_poly, name, messages):
+    if not messages:
+        return
+    sa = vtk.vtkStringArray()
+    sa.SetName(name)
+    for m in messages:
+        sa.InsertNextValue(m)
+    out_poly.GetFieldData().AddArray(sa)
+
+# --------------------------------
+# Segment-level grouping
+# --------------------------------
+unique_segments = np.unique(segment_id)
+seg_to_indices = {int(s): [] for s in unique_segments}
+
+for i in range(num_points):
+    seg_to_indices[int(segment_id[i])].append(i)
+
+# --------------------------------
+# Compute segment-level power values
+# --------------------------------
+segment_values = {}
+messages = []
+
+for s in unique_segments:
+    s_int = int(s)
+    inds = seg_to_indices.get(s_int, [])
+
+    if not inds:
+        continue
+
+    seg_power = np.array([power_vals[i] for i in inds], dtype=float)
+    finite_mask = np.isfinite(seg_power)
+
+    if np.any(finite_mask):
+        # Use first finite value (consistent with your prior logic)
+        seg_value = float(seg_power[finite_mask][0])
+
+        # Alternative (more robust):
+        # seg_value = float(np.mean(seg_power[finite_mask]))
+    else:
+        seg_value = np.nan
+
+    segment_values[s_int] = seg_value
+
+    if not np.isfinite(seg_value):
+        messages.append(f"[Power Quartile] Segment {s_int}: no finite values.")
+
+# --------------------------------
+# Compute 75th percentile threshold
+# --------------------------------
+all_values = np.array(
+    [v for v in segment_values.values() if np.isfinite(v)],
+    dtype=float
+)
+
+if len(all_values) == 0:
+    raise RuntimeError("No finite segment power values found.")
+
+
+
+messages.append(f"[Power Quartile] 75th percentile threshold = {quartile_75:.6e}")
+
+# --------------------------------
+# Assign flags to segments
+# --------------------------------
+threshold_arr = np.zeros(num_points, dtype=np.int32)
+num = 0
+
+for s in unique_segments:
+    s_int = int(s)
+    inds = seg_to_indices.get(s_int, [])
+    seg_value = segment_values.get(s_int, np.nan)
+
+    if np.isfinite(seg_value) and seg_value >= quartile_75:
+        flag = 1
+        messages.append(f"[Power Quartile] Segment {s_int}: {seg_value:.6e} >= threshold → 1")
+        num = num+1
+    else:
+        flag = 0
+        if np.isfinite(seg_value):
+            messages.append(f"[Power Quartile] Segment {s_int}: {seg_value:.6e} < threshold → 0")
+        else:
+            messages.append(f"[Power Quartile] Segment {s_int}: undefined → 0")
+
+    threshold_arr[np.array(inds, dtype=int)] = flag
+
+
+
+# --------------------------------
+# Output
+# --------------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+add_point_array(out, "Threshold_Power_highestMulti-modelQuartile", threshold_arr)
+
+# Optional logging
+if LOG_MESSAGES and len(messages) > 0:
+    try:
+        print("\n".join(messages))
+    except Exception:
+        pass
+    add_field_string_array(out, "Threshold_Power_highestMulti-modelQuartile", messages)
+print("number above threshold: ", num)

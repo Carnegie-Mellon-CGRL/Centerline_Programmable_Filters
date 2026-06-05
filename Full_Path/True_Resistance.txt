@@ -1,0 +1,336 @@
+
+import vtk
+import math
+from collections import deque
+
+# ----------------------------
+# Configuration
+# ----------------------------
+CLIP_THRESHOLD_FACTOR = 1.4   # if slice max distance > factor * centerline radius => clip interior
+BLOOD_VISCOSITY = 0.04      # Poise (≈ 4.0 cP, the Simvascular cgs value) -- ensure unit consistency with geometry
+VESSEL_LENGTH   = 0.01        # cm
+MIN_RADIUS_EPS  = 1e-6        # clamp very small radii to avoid blow-ups in resistance
+
+VERBOSE = False
+def log(msg):
+    if VERBOSE:
+        print(msg)
+
+# ----------------------------
+# Helpers (pure VTK/Python — no NumPy reductions)
+# ----------------------------
+def build_connectivity(polydata):
+    """Undirected adjacency (point id → neighbor ids) from polyline cells."""
+    npts = polydata.GetNumberOfPoints()
+    conn = [[] for _ in range(npts)]
+    for cid in range(polydata.GetNumberOfCells()):
+        cell = polydata.GetCell(cid)
+        m = cell.GetNumberOfPoints()
+        for j in range(m - 1):
+            p1 = cell.GetPointId(j)
+            p2 = cell.GetPointId(j + 1)
+            if p2 not in conn[p1]:
+                conn[p1].append(p2)
+            if p1 not in conn[p2]:
+                conn[p2].append(p1)
+    return conn
+
+def bfs_path(connectivity, start, end):
+    """Return one shortest path (list of point ids) from start to end; [] if none."""
+    if start == end:
+        return [start]
+    visited = set([start])
+    parent = {start: -1}
+    dq = deque([start])
+    while dq:
+        u = dq.popleft()
+        for nb in connectivity[u]:
+            if nb not in visited:
+                visited.add(nb)
+                parent[nb] = u
+                if nb == end:
+                    # reconstruct path
+                    path = [nb]
+                    while parent[path[-1]] != -1:
+                        path.append(parent[path[-1]])
+                    path.reverse()
+                    return path
+                dq.append(nb)
+    return []
+
+def normalize(vx, vy, vz):
+    n = math.sqrt(vx*vx + vy*vy + vz*vz)
+    if n > 0.0 and math.isfinite(n):
+        return (vx/n, vy/n, vz/n)
+    return (1.0, 0.0, 0.0)  # safe fallback
+
+def average_and_max_edge_radius(points_vtk, center_tuple):
+    """
+    Compute (average distance, max distance) from center to polyline vertices (edge points).
+    No NumPy reductions.
+    """
+    if points_vtk is None:
+        return (0.0, 0.0)
+    n = points_vtk.GetNumberOfPoints()
+    if n == 0:
+        return (0.0, 0.0)
+    cx, cy, cz = center_tuple
+    total = 0.0
+    maxd  = 0.0
+    pt = [0.0, 0.0, 0.0]
+    for i in range(n):
+        points_vtk.GetPoint(i, pt)
+        dx = pt[0] - cx
+        dy = pt[1] - cy
+        dz = pt[2] - cz
+        d = math.sqrt(dx*dx + dy*dy + dz*dz)
+        total += d
+        if d > maxd:
+            maxd = d
+    return (total / float(n), maxd)
+
+# ----------------------------
+# Inputs
+# ----------------------------
+grouped_input = self.GetInputDataObject(0, 0)
+if grouped_input is None:
+    raise RuntimeError("Expected a MultiBlock input at port 0.")
+
+centerline = grouped_input.GetBlock(0)
+surface    = grouped_input.GetBlock(1)
+
+if centerline is None or centerline.GetPoints() is None:
+    raise RuntimeError("Centerline (block 0) missing or has no points.")
+if surface is None:
+    raise RuntimeError("Surface (block 1) missing.")
+
+num_points = centerline.GetNumberOfPoints()
+log(f"[Info] Centerline points: {num_points}")
+
+pd = centerline.GetPointData()
+filtered_radius_vtk = pd.GetArray("Filtered_Radius")
+blanking_vtk        = pd.GetArray("blanking")
+is_inlet_vtk        = pd.GetArray("IsInlet")
+is_outlet_vtk       = pd.GetArray("IsOutlet")
+
+if filtered_radius_vtk is None or blanking_vtk is None:
+    raise RuntimeError("Required arrays not found: 'Filtered_Radius' and/or 'blanking'.")
+
+# ----------------------------
+# Use IsInlet / IsOutlet to build ordered paths
+# ----------------------------
+connectivity = build_connectivity(centerline)
+
+inlet_ids  = []
+outlet_ids = []
+if is_inlet_vtk is not None and is_outlet_vtk is not None:
+    for i in range(num_points):
+        if int(is_inlet_vtk.GetTuple1(i)) == 1:
+            inlet_ids.append(i)
+        if int(is_outlet_vtk.GetTuple1(i)) == 1:
+            outlet_ids.append(i)
+else:
+    # If either array is missing, process all points with a trivial order.
+    inlet_ids  = []
+    outlet_ids = []
+
+paths = []
+if inlet_ids and outlet_ids:
+    for s in inlet_ids:
+        for t in outlet_ids:
+            path = bfs_path(connectivity, s, t)
+            if path:
+                paths.append(path)
+    if not paths:
+        # Fallback if flags present but no path found
+        paths = [list(range(num_points))]
+        log("[Warn] Inlet/Outlet flags present but no path found; using index order.")
+else:
+    # No flags: single trivial "path" using index order
+    paths = [list(range(num_points))]
+    log("[Warn] 'IsInlet'/'IsOutlet' missing; using index order for normals.")
+
+# ----------------------------
+# Compute per-point normals from ordered paths
+# ----------------------------
+path_normal = {}     # pid -> (nx, ny, nz)
+path_weight = {}     # pid -> path length (to prefer normals from longer paths)
+path_order  = {}     # pid -> order index along its chosen path
+branch_id   = {}     # pid -> outlet id (point id) of the path this pid belongs to
+
+pt = [0.0, 0.0, 0.0]
+qt = [0.0, 0.0, 0.0]
+
+for path in paths:
+    plen = len(path)
+    if plen == 0:
+        continue
+
+    # Determine outlet id for this path (last index if flags exist)
+    outlet_for_path = path[-1] if outlet_ids else -1
+
+    for k, pid in enumerate(path):
+        centerline.GetPoint(pid, pt)
+        if k < plen - 1:
+            pid_next = path[k + 1]
+            centerline.GetPoint(pid_next, qt)
+            vx, vy, vz = (qt[0] - pt[0]), (qt[1] - pt[1]), (qt[2] - pt[2])
+        elif plen >= 2:
+            pid_prev = path[k - 1]
+            centerline.GetPoint(pid_prev, qt)
+            vx, vy, vz = (pt[0] - qt[0]), (pt[1] - qt[1]), (pt[2] - qt[2])
+        else:
+            # isolated single-point path
+            vx, vy, vz = (1.0, 0.0, 0.0)
+
+        nx, ny, nz = normalize(vx, vy, vz)
+
+        # Only overwrite if this comes from a longer (or equal longer) path
+        if (pid not in path_normal) or (plen > path_weight.get(pid, -1)):
+            path_normal[pid] = (nx, ny, nz)
+            path_weight[pid] = plen
+            path_order[pid]  = k
+            branch_id[pid]   = outlet_for_path
+
+# Set of points to process = union of all paths
+valid_path_points = set()
+for pth in paths:
+    for pid in pth:
+        valid_path_points.add(pid)
+
+# ----------------------------
+# Prepare output arrays
+# ----------------------------
+avg_arr = vtk.vtkDoubleArray()
+avg_arr.SetName("Slice_Average_Radius")
+avg_arr.SetNumberOfComponents(1)
+avg_arr.SetNumberOfTuples(num_points)
+avg_arr.FillComponent(0, 0.0)
+
+clip_arr = vtk.vtkIntArray()
+clip_arr.SetName("Use_Clipping_Flag")
+clip_arr.SetNumberOfComponents(1)
+clip_arr.SetNumberOfTuples(num_points)
+clip_arr.FillComponent(0, 0)
+
+res_arr = vtk.vtkDoubleArray()
+res_arr.SetName("Poiseuille_Resistance")
+res_arr.SetNumberOfComponents(1)
+res_arr.SetNumberOfTuples(num_points)
+res_arr.FillComponent(0, 0.0)
+
+# Optional: diagnostic/utility arrays
+order_arr = vtk.vtkIntArray()
+order_arr.SetName("PathOrder")
+order_arr.SetNumberOfComponents(1)
+order_arr.SetNumberOfTuples(num_points)
+order_arr.FillComponent(0, -1)
+
+branch_arr = vtk.vtkIntArray()
+branch_arr.SetName("BranchOutletId")  # store outlet pid this point flows to
+branch_arr.SetNumberOfComponents(1)
+branch_arr.SetNumberOfTuples(num_points)
+branch_arr.FillComponent(0, -1)
+
+on_path_flag = vtk.vtkIntArray()
+on_path_flag.SetName("OnAnyPathFlag")
+on_path_flag.SetNumberOfComponents(1)
+on_path_flag.SetNumberOfTuples(num_points)
+on_path_flag.FillComponent(0, 0)
+
+# ----------------------------
+# Main loop over path points
+# ----------------------------
+for pid in sorted(valid_path_points):
+    on_path_flag.SetTuple1(pid, 1)
+    if pid in path_order:
+        order_arr.SetTuple1(pid, int(path_order[pid]))
+    if pid in branch_id:
+        branch_arr.SetTuple1(pid, int(branch_id[pid]))
+
+    # Center point
+    p = [0.0, 0.0, 0.0]
+    centerline.GetPoint(pid, p)
+    p_tuple = (float(p[0]), float(p[1]), float(p[2]))
+
+    # Path-based normal (forward along path)
+    nrm = path_normal.get(pid, (1.0, 0.0, 0.0))
+
+    # Centerline radius (for clipping heuristic)
+    r_centerline = float(filtered_radius_vtk.GetTuple1(pid))
+    if not (r_centerline > 0.0) or not math.isfinite(r_centerline):
+        r_centerline = 1.0
+
+    # Slice plane
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(p_tuple)
+    plane.SetNormal(nrm)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetCutFunction(plane)
+    cutter.SetInputData(surface)
+    cutter.Update()
+    cut_output = cutter.GetOutput()
+
+    # Keep closest contour loop to center point
+    region = vtk.vtkPolyDataConnectivityFilter()
+    region.SetInputData(cut_output)
+    region.SetExtractionModeToClosestPointRegion()
+    region.SetClosestPoint(p_tuple)
+    region.Update()
+    filtered_slice = region.GetOutput()
+
+    pts = filtered_slice.GetPoints()
+    avg_r = 0.0
+
+    if pts is not None and pts.GetNumberOfPoints() > 0:
+        avg_unclipped, max_unclipped = average_and_max_edge_radius(pts, p_tuple)
+
+        use_clip = (int(blanking_vtk.GetTuple1(pid)) != 0) or (max_unclipped > CLIP_THRESHOLD_FACTOR * r_centerline)
+        clip_arr.SetTuple1(pid, 1 if use_clip else 0)
+
+        if use_clip:
+            sphere = vtk.vtkSphere()
+            sphere.SetCenter(p_tuple)
+            sphere.SetRadius(r_centerline)
+
+            clipper = vtk.vtkClipPolyData()
+            clipper.SetInputData(filtered_slice)
+            clipper.SetClipFunction(sphere)
+            clipper.InsideOutOn()  # keep inside sphere
+            clipper.Update()
+            clipped = clipper.GetOutput()
+
+            cpts = clipped.GetPoints()
+            if cpts is not None and cpts.GetNumberOfPoints() > 0:
+                avg_clipped, _ = average_and_max_edge_radius(cpts, p_tuple)
+                avg_r = avg_clipped
+            else:
+                avg_r = avg_unclipped
+        else:
+            avg_r = avg_unclipped
+    else:
+        clip_arr.SetTuple1(pid, 0)
+        avg_r = 0.0
+
+    # Store average radius
+    avg_arr.SetTuple1(pid, float(avg_r))
+
+    # Poiseuille Resistance: R = 8 μ L / (π r^4)  (Unit-consistent!)
+    r_safe = avg_r if avg_r > MIN_RADIUS_EPS else MIN_RADIUS_EPS
+    R = (8.0 * BLOOD_VISCOSITY * VESSEL_LENGTH) / (math.pi * (r_safe ** 4))
+    if avg_r <= MIN_RADIUS_EPS:
+        R = 0.0
+    res_arr.SetTuple1(pid, float(R))
+	
+# ----------------------------
+# Attach arrays & output
+# ----------------------------
+pd.AddArray(avg_arr)
+pd.AddArray(clip_arr)
+pd.AddArray(res_arr)
+pd.AddArray(order_arr)
+pd.AddArray(branch_arr)
+pd.AddArray(on_path_flag)
+
+output.ShallowCopy(centerline)

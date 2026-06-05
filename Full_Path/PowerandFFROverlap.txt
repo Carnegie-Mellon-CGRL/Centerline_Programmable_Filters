@@ -1,0 +1,111 @@
+import numpy as np
+from collections import defaultdict
+
+# --------------------------------
+# USER PARAMETER
+# --------------------------------
+POWER_THRESHOLD = 2354     #  EDIT THIS VALUE
+
+# --------------------------------
+# Get input
+# --------------------------------
+input0 = self.GetInputDataObject(0, 0)
+pd = input0.GetPointData()
+n_pts = input0.GetNumberOfPoints()
+
+# --------------------------------
+# Arrays
+# --------------------------------
+segment_ids = pd.GetArray("segment_ID")
+ffr_array   = pd.GetArray("Threshold_FFR_0.8")
+power_array = pd.GetArray("Segment-Power_flow_offset_outlet_average")
+
+if segment_ids is None or ffr_array is None or power_array is None:
+    raise RuntimeError("Missing required arrays.")
+
+# --------------------------------
+# Convert to numpy (SAFE explicit)
+# --------------------------------
+seg   = np.array([segment_ids.GetValue(i) for i in range(n_pts)])
+ffr   = np.array([ffr_array.GetValue(i) for i in range(n_pts)])
+power = np.array([power_array.GetValue(i) for i in range(n_pts)])
+
+# --------------------------------
+# Segment aggregation
+# --------------------------------
+segment_data = defaultdict(lambda: {"ffr": 0, "power": 0})
+
+for i in range(n_pts):
+    s = seg[i]
+
+    if not np.isfinite(s):
+        continue
+
+    # FFR condition
+    if ffr[i] == 1:
+        segment_data[s]["ffr"] = 1
+
+    # Power threshold condition
+    if power[i] >= POWER_THRESHOLD:
+        segment_data[s]["power"] = 1
+
+# --------------------------------
+# Counts
+# --------------------------------
+total_segments = len(segment_data)
+
+ffr_count = 0
+power_count = 0
+both_count = 0
+
+for s in segment_data:
+    f = segment_data[s]["ffr"]
+    p = segment_data[s]["power"]
+
+    if f == 1:
+        ffr_count += 1
+    if p == 1:
+        power_count += 1
+    if f == 1 and p == 1:
+        both_count += 1
+
+# --------------------------------
+# Create output array (paint segments)
+# --------------------------------
+overlap = np.zeros(n_pts, dtype=np.int32)
+
+for i in range(n_pts):
+    s = seg[i]
+
+    if not np.isfinite(s):
+        overlap[i] = 0
+        continue
+
+    data = segment_data[s]
+
+    if data["ffr"] == 1 and data["power"] == 1:
+        overlap[i] = 1
+    else:
+        overlap[i] = 0
+
+# --------------------------------
+# Print summary
+# --------------------------------
+print(
+    f"FFR Threshold = {ffr_count} segments, "
+    f"Power Threshold = {power_count} segments, "
+    f"Overlap = {both_count} segments"
+)
+
+# --------------------------------
+# Add array to output
+# --------------------------------
+import vtk
+from vtkmodules.util import numpy_support
+
+out = self.GetOutput()
+out.DeepCopy(input0)
+
+vtk_arr = numpy_support.numpy_to_vtk(overlap, deep=1)
+vtk_arr.SetName("Threshold_FFR0.8_Power_Overlap")
+out.GetPointData().AddArray(vtk_arr)

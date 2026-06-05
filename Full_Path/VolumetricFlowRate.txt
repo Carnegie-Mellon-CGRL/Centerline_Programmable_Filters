@@ -1,0 +1,175 @@
+import vtk
+import numpy as np
+from vtkmodules.util import numpy_support
+from collections import deque
+
+#--------------------------------------------------
+# Inputs
+#--------------------------------------------------
+grouped_input = inputs[0]
+centerline = grouped_input.GetBlock(0)   # .vtp
+volume = grouped_input.GetBlock(1)       # .vtu
+
+centerline_points = numpy_support.vtk_to_numpy(
+    centerline.GetPoints().GetData()
+)
+
+num_points = centerline.GetNumberOfPoints()
+
+# Required centerline arrays
+is_inlet = numpy_support.vtk_to_numpy(
+    centerline.GetPointData().GetArray("IsInlet")
+)
+is_outlet = numpy_support.vtk_to_numpy(
+    centerline.GetPointData().GetArray("IsOutlet")
+)
+
+#--------------------------------------------------
+# Build connectivity graph of the centerline
+#--------------------------------------------------
+connectivity = {i: [] for i in range(num_points)}
+
+for cid in range(centerline.GetNumberOfCells()):
+    cell = centerline.GetCell(cid)
+    for j in range(cell.GetNumberOfPoints() - 1):
+        p0 = cell.GetPointId(j)
+        p1 = cell.GetPointId(j + 1)
+        connectivity[p0].append(p1)
+        connectivity[p1].append(p0)
+
+#--------------------------------------------------
+# DFS path finder
+#--------------------------------------------------
+def find_path_dfs(connectivity, start, end):
+    stack = [(start, [start])]
+    visited = set()
+
+    while stack:
+        node, path = stack.pop()
+        if node == end:
+            return path
+        if node not in visited:
+            visited.add(node)
+            for nb in connectivity[node]:
+                if nb not in visited:
+                    stack.append((nb, path + [nb]))
+    return []
+
+#--------------------------------------------------
+# Collect all valid inlet-to-outlet points
+#--------------------------------------------------
+valid_path_points = set()
+
+inlet_ids = np.where(is_inlet == 1)[0]
+outlet_ids = np.where(is_outlet == 1)[0]
+
+for i in inlet_ids:
+    for o in outlet_ids:
+        path = find_path_dfs(connectivity, i, o)
+        valid_path_points.update(path)
+
+#--------------------------------------------------
+# Output array
+#--------------------------------------------------
+volumetric_flow_array = np.zeros(num_points)
+flow_array = np.zeros(num_points)
+
+#--------------------------------------------------
+# Main loop
+#--------------------------------------------------
+for i in valid_path_points:
+
+    origin = centerline_points[i]
+
+    # --- Estimate centerline direction ---
+    if i in connectivity and len(connectivity[i]) > 0:
+        next_id = connectivity[i][0]
+        tangent = centerline_points[next_id] - origin
+    elif i > 0:
+        tangent = origin - centerline_points[i - 1]
+    else:
+        continue
+
+    norm = np.linalg.norm(tangent)
+    if norm == 0:
+        continue
+    tangent /= norm
+
+    # --- Slice the volume ---
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(origin)
+    plane.SetNormal(tangent)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetInputData(volume)
+    cutter.SetCutFunction(plane)
+    cutter.Update()
+
+    cut_output = cutter.GetOutput()
+    if cut_output.GetNumberOfPoints() == 0:
+        continue
+
+    # --- Isolate closest connected slice ---
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputData(cut_output)
+    conn.SetExtractionModeToClosestPointRegion()
+    conn.SetClosestPoint(origin)
+    conn.Update()
+    slice_pd = conn.GetOutput()
+
+    if slice_pd.GetNumberOfCells() == 0:
+        continue
+
+    # --- Triangulate ---
+    triangulator = vtk.vtkTriangleFilter()
+    triangulator.SetInputData(slice_pd)
+    triangulator.Update()
+    tri_pd = triangulator.GetOutput()
+
+    # --- Velocity ---
+    vel_vtk = tri_pd.GetPointData().GetArray("velocity")
+    if vel_vtk is None:
+        continue
+
+    vel = numpy_support.vtk_to_numpy(vel_vtk)
+    pts = numpy_support.vtk_to_numpy(tri_pd.GetPoints().GetData())
+
+    # --- Surface integral ---
+    Q = 0.0
+
+    for cid in range(tri_pd.GetNumberOfCells()):
+        cell = tri_pd.GetCell(cid)
+        if cell.GetCellType() != vtk.VTK_TRIANGLE:
+            continue
+
+        ids = [cell.GetPointId(k) for k in range(3)]
+        p0, p1, p2 = pts[ids]
+
+        # Triangle area
+        area_vec = np.cross(p1 - p0, p2 - p0)
+        area = 0.5 * np.linalg.norm(area_vec)
+        if area == 0:
+            continue
+
+        # Average velocity at triangle
+        v_avg = (vel[ids[0]] + vel[ids[1]] + vel[ids[2]]) / 3.0
+
+        # Flux contribution
+        Q += np.dot(v_avg, tangent) * area
+
+    volumetric_flow_array[i] = Q
+    flow_array[i] = -volumetric_flow_array[i]
+
+#--------------------------------------------------
+# Attach output
+#--------------------------------------------------
+volumetric_flow_vtk = numpy_support.numpy_to_vtk(volumetric_flow_array)
+volumetric_flow_vtk.SetName("VolumetricFlowRate")
+
+flow_vtk = numpy_support.numpy_to_vtk(flow_array)
+flow_vtk.SetName("Flow")
+
+centerline.GetPointData().AddArray(volumetric_flow_vtk)
+centerline.GetPointData().AddArray(flow_vtk)
+
+output.ShallowCopy(centerline)

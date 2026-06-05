@@ -1,0 +1,145 @@
+import vtk
+from vtkmodules.util import numpy_support
+import numpy as np
+from collections import deque
+import math
+
+# --------------------------------
+# Parameters / Toggles
+# --------------------------------
+USE_BLANKING = False           # include all points; do not gate by Blanking
+VALID_BLANKING_VALUE = 0       # unused when USE_BLANKING is False
+
+EPS = 1e-14
+FLOW_EPS = 1e-14               # optional tiny threshold for near-zero flow handling
+FFR_MIN_BASELINE = 1e-12       # guard for division in FFR
+UNDEFINED_FILL_VALUE = 1.0     # sentinel used elsewhere for undefined FFR
+LOG_UNDEFINED = True
+
+# Threshold for segment flagging
+THRESHOLD_FFR = 0.8
+
+# --------------------------------
+# Input (PolyData)
+# --------------------------------
+poly = self.GetInputDataObject(0, 0)
+if poly is None or poly.GetPoints() is None:
+    raise RuntimeError("No input on port 0 or input has no points.")
+
+num_points = poly.GetNumberOfPoints()
+pd = poly.GetPointData()
+
+# --------------------------------
+# Required arrays
+# --------------------------------
+is_inlet_vtk  = pd.GetArray("IsInlet")
+is_outlet_vtk = pd.GetArray("IsOutlet")
+ffr_vtk       = pd.GetArray("Segment_FFR_byPressureAverage")
+segment_vtk   = pd.GetArray("segment_ID")  # existing segment IDs
+
+missing = []
+if is_inlet_vtk is None:  missing.append("IsInlet")
+if is_outlet_vtk is None: missing.append("IsOutlet")
+if ffr_vtk is None:       missing.append("Segment_FFR_byPressureAverage")
+if segment_vtk is None:   missing.append("segment_ID")
+if missing:
+    raise RuntimeError("Missing required array(s): " + ", ".join(missing))
+
+# --------------------------------
+# NumPy views
+# --------------------------------
+points_np  = numpy_support.vtk_to_numpy(poly.GetPoints().GetData()).astype(float, copy=False)
+is_inlet   = numpy_support.vtk_to_numpy(is_inlet_vtk).astype(int, copy=False)
+is_outlet  = numpy_support.vtk_to_numpy(is_outlet_vtk).astype(int, copy=False)
+ffr_vals   = numpy_support.vtk_to_numpy(ffr_vtk).astype(float, copy=False)
+segment_id = numpy_support.vtk_to_numpy(segment_vtk).astype(np.int64, copy=False)
+
+# --------------------------------
+# Helpers
+# --------------------------------
+def add_point_array(out_poly, name, arr, num_comps=1):
+    vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+    vtk_arr.SetName(name)
+    vtk_arr.SetNumberOfComponents(num_comps)
+    out_poly.GetPointData().AddArray(vtk_arr)
+
+def add_field_string_array(out_poly, name, messages):
+    if not messages:
+        return
+    sa = vtk.vtkStringArray()
+    sa.SetName(name)
+    for m in messages:
+        sa.InsertNextValue(m)
+    out_poly.GetFieldData().AddArray(sa)
+
+# --------------------------------
+# Segment-level setup
+# --------------------------------
+unique_segments = np.unique(segment_id)
+seg_to_indices = {int(s): [] for s in unique_segments}
+for i in range(num_points):
+    seg_to_indices[int(segment_id[i])].append(i)
+
+# Output array: 1 if segment FFR < 0.8, else 0 (painted to points)
+threshold_ffr_arr = np.zeros(num_points, dtype=np.int32)
+
+messages = []
+
+# --------------------------------
+# Compute per-segment threshold flags
+# --------------------------------
+for s in unique_segments:
+    s_int = int(s)
+    inds = seg_to_indices.get(s_int, [])
+    if not inds:
+        continue
+
+    # Extract FFR values for this segment
+    seg_ffr = np.array([ffr_vals[i] for i in inds], dtype=float)
+    finite_mask = np.isfinite(seg_ffr)
+
+    # Strategy: use the first finite value (arrays are typically constant per segment)
+    if np.any(finite_mask):
+        # Option A (default): first finite
+        seg_value = float(seg_ffr[finite_mask][0])
+
+        # Option B (alternate): mean over finite values
+        # seg_value = float(np.mean(seg_ffr[finite_mask]))
+    else:
+        seg_value = np.nan
+
+    # Decide flag: 1 if (finite and < threshold); otherwise 0
+    if np.isfinite(seg_value) and (seg_value < THRESHOLD_FFR):
+        flag = 1
+    else:
+        flag = 0
+
+    # Paint to all points in the segment
+    threshold_ffr_arr[np.array(inds, dtype=int)] = flag
+
+    # Optional message logging for undefined or edge cases
+    if not np.isfinite(seg_value):
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: no finite Segment_FFR_byPressureAverage; set flag=0.")
+    elif seg_value == UNDEFINED_FILL_VALUE:
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: Segment_FFR_byPressureAverage equals UNDEFINED_FILL_VALUE ({UNDEFINED_FILL_VALUE}); set flag=0.")
+    elif seg_value < THRESHOLD_FFR:
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: FFR={seg_value:.4f} < {THRESHOLD_FFR}; set flag=1.")
+    else:
+        messages.append(f"[Threshold_FFR_0.8] Segment {s_int}: FFR={seg_value:.4f} >= {THRESHOLD_FFR}; set flag=0.")
+
+# --------------------------------
+# Output
+# --------------------------------
+out = self.GetOutput()
+out.DeepCopy(poly)
+
+# Segment-level threshold array (painted to points)
+add_point_array(out, "Threshold_FFR_0.8", threshold_ffr_arr)
+
+# Optional: keep a log of decisions
+if LOG_UNDEFINED and len(messages) > 0:
+    try:
+        print("\n".join(messages))
+    except Exception:
+        pass
+    add_field_string_array(out, "Threshold_FFR_0.8_Messages", messages)

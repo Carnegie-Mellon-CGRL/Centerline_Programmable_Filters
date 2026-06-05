@@ -5,14 +5,15 @@ from collections import deque
 import math
 
 # --------------------------------
-# Parameters / toggles
+# Parameters / Toggles
 # --------------------------------
-USE_BLANKING = False          # include all points; do not gate by Blanking
-VALID_BLANKING_VALUE = 0      # unused when USE_BLANKING is False
+USE_BLANKING = False           # include all points; do not gate by Blanking
+VALID_BLANKING_VALUE = 0       # unused when USE_BLANKING is False
 
 EPS = 1e-14
-FFR_MIN_BASELINE = 1e-12
-UNDEFINED_FILL_VALUE = 1.0  # for undefined FFR cases (easy-to-spot sentinel)
+FLOW_EPS = 1e-14               # optional tiny threshold for near-zero flow handling
+FFR_MIN_BASELINE = 1e-12       # guard for division in FFR
+UNDEFINED_FILL_VALUE = 1.0     # for undefined FFR (easy-to-spot sentinel)
 LOG_UNDEFINED = True
 
 # --------------------------------
@@ -35,7 +36,7 @@ pd = poly.GetPointData()
 is_inlet_vtk   = pd.GetArray("IsInlet")
 is_outlet_vtk  = pd.GetArray("IsOutlet")
 pressure_vtk   = pd.GetArray("pressure")
-segment_vtk    = pd.GetArray("segment_ID")  # kept for your existing segment arrays
+segment_vtk    = pd.GetArray("segment_ID")  # existing segment IDs
 
 if is_inlet_vtk is None:
     raise RuntimeError("Missing required array: 'IsInlet'.")
@@ -137,19 +138,27 @@ adj = build_connectivity(poly)
 inlet_idx  = np.where(is_inlet == 1)[0]
 outlet_idx = np.where(is_outlet == 1)[0]
 
+# Pre-create defaults for early-exit case
+default_zero = np.zeros(num_points, dtype=float)
+default_nan  = np.full(num_points, np.nan, dtype=float)
+default_m1   = np.full(num_points, -1, dtype=np.int64)
+default_ffr_undef = np.full(num_points, UNDEFINED_FILL_VALUE, dtype=float)
+
 if inlet_idx.size == 0 or outlet_idx.size == 0:
     out = self.GetOutput()
     out.DeepCopy(poly)
-    add_point_array(out, "Power_PressureDrop", np.zeros(num_points))
-    add_point_array(out, "Segment_Power_PressureDrop", np.zeros(num_points))
-    add_point_array(out, "Segment_PressureAverage", np.zeros(num_points))
-    add_point_array(out, "Segment_FFR_perBranch", np.zeros(num_points))
-    add_point_array(out, "Segment_FFR_byPressureAverage", np.zeros(num_points))
-    add_point_array(out, "Parent_Branch", np.full(num_points, -1, dtype=np.int64))
-    # New branch arrays
-    add_point_array(out, "z-branch_ID", np.full(num_points, -1, dtype=np.int64))
-    add_point_array(out, "z-branch_Parent", np.full(num_points, -1, dtype=np.int64))
-    add_point_array(out, "z-branch_FFR", np.full(num_points, UNDEFINED_FILL_VALUE, dtype=float))
+    add_point_array(out, "Power_PressureDrop", default_zero)
+    add_point_array(out, "Segmental_Flow", default_zero)  # new
+    add_point_array(out, "Segment_Power_PressureDrop", default_zero)
+    add_point_array(out, "Segment_PressureAverage", default_zero)
+    add_point_array(out, "Segment_FFR_perBranch", default_zero)
+    add_point_array(out, "Segment_FFR_byPressureAverage", default_zero)
+    add_point_array(out, "z-branch_ID", default_m1)
+    add_point_array(out, "z-branch_Parent", default_m1)
+    add_point_array(out, "z-branch_FFR", default_ffr_undef)
+    if LOG_UNDEFINED:
+        add_field_string_array(out, "BranchAndSegment_FFR_Messages",
+                               ["No inlets or outlets present. Arrays written as defaults."])
     raise RuntimeError("No inlets or outlets present. Arrays written as defaults.")
 
 reach_in  = multi_source_bfs(inlet_idx,  adj)
@@ -168,12 +177,13 @@ for v in valid_idx:
         children[u].append(v)
 
 # --------------------------------
-# Flow fallback (only if no Flow is present)
+# Flow fallback (only if no Flow array)
 # --------------------------------
 tangent = np.zeros((num_points, 3), dtype=float)
 need_flow_fallback = (flow is None) and (filtered_area is not None) and (velocity is not None)
 
 if need_flow_fallback:
+    # Estimate tangents from neighbor vectors on valid subgraph
     for i in valid_idx:
         neigh = [n for n in adj[i] if n in valid_set]
         if not neigh:
@@ -183,6 +193,7 @@ if need_flow_fallback:
         nrm = np.linalg.norm(t)
         if nrm > EPS and np.isfinite(nrm):
             tangent[i] = t / nrm
+    # Project velocity onto tangent and multiply by area
     flow = np.zeros(num_points, dtype=float)
     for i in valid_idx:
         if filtered_area is None or velocity is None:
@@ -202,12 +213,12 @@ elif flow is None:
     flow = np.zeros(num_points, dtype=float)
 
 # --------------------------------
-# Per-point: Power_PressureDrop (kept as before)
+# Per-point: Power_PressureDrop (unchanged logic)
 # --------------------------------
 power_pd = np.zeros(num_points, dtype=float)
 for i in range(num_points):
     if is_inlet[i] == 1:
-        power_pd[i] = 1.0
+        power_pd[i] = 1.0  # mark inlet (legacy behavior)
         continue
     if not valid_mask[i]:
         continue
@@ -220,55 +231,81 @@ for i in range(num_points):
         power_pd[i] = dp_i * q_i
 
 # --------------------------------
-# Segment-level arrays (kept for compatibility)
+# Segment-level setup
 # --------------------------------
 unique_segments = np.unique(segment_id)
 seg_to_indices = {int(s): [] for s in unique_segments}
 for i in range(num_points):
     seg_to_indices[int(segment_id[i])].append(i)
 
-segment_power_pd = np.zeros(num_points, dtype=float)
-segment_ffr_per_branch = np.zeros(num_points, dtype=float)
-segment_pressure_avg = np.full(num_points, np.nan, dtype=float)
+segment_power_pd          = np.zeros(num_points, dtype=float)
+segment_ffr_per_branch    = np.zeros(num_points, dtype=float)
+segment_pressure_avg      = np.full(num_points, np.nan, dtype=float)
+segmental_flow_arr        = np.zeros(num_points, dtype=float)  # NEW: per-point copy of segment-average flow
+segment_ffr_by_pressure_avg = np.full(num_points, UNDEFINED_FILL_VALUE, dtype=float)
 
 seg_mean_pressure = {}
 seg_start_idx = {}
 seg_end_idx = {}
 seg_start_dist = {}
 
+# --------------------------------
+# Compute per-segment quantities
+# --------------------------------
 for s in unique_segments:
-    inds_all = seg_to_indices[int(s)]
+    s_int = int(s)
+    inds_all = seg_to_indices[s_int]
     if not inds_all:
-        seg_mean_pressure[int(s)] = np.nan
+        seg_mean_pressure[s_int] = np.nan
         continue
 
+    # Segment mean pressure (finite points only)
     pvals = np.array([pressure[i] for i in inds_all], dtype=float)
-    finite_mask = np.isfinite(pvals)
-    seg_mean = float(np.mean(pvals[finite_mask])) if np.any(finite_mask) else np.nan
-    seg_mean_pressure[int(s)] = seg_mean
+    pmask = np.isfinite(pvals)
+    seg_mean = float(np.mean(pvals[pmask])) if np.any(pmask) else np.nan
+    seg_mean_pressure[s_int] = seg_mean
     segment_pressure_avg[np.array(inds_all, dtype=int)] = seg_mean
 
+    # Identify most-upstream and most-downstream points by tree distance
     inds_valid = [i for i in inds_all if valid_mask[i] and np.isfinite(dist[i])]
     if not inds_valid:
+        # Still compute segmental flow average (could be used downstream / be visible)
+        qvals = np.array([flow[i] for i in inds_all], dtype=float)
+        qmask = np.isfinite(qvals)
+        q_mean = float(np.mean(qvals[qmask])) if np.any(qmask) else 0.0  # 0.0 if no finite flows
+        segmental_flow_arr[np.array(inds_all, dtype=int)] = q_mean
         continue
+
     dvals = np.array([dist[i] for i in inds_valid], dtype=float)
     start_i = inds_valid[int(np.argmin(dvals))]
     end_i   = inds_valid[int(np.argmax(dvals))]
 
-    seg_start_idx[int(s)] = start_i
-    seg_end_idx[int(s)]   = end_i
-    seg_start_dist[int(s)] = float(dist[start_i])
+    seg_start_idx[s_int]  = start_i
+    seg_end_idx[s_int]    = end_i
+    seg_start_dist[s_int] = float(dist[start_i])
 
+    # Pressures at the segment start/end (finite guards)
     p_start = pressure[start_i] if np.isfinite(pressure[start_i]) else np.nan
     p_end   = pressure[end_i]   if np.isfinite(pressure[end_i])   else np.nan
-    q_start = flow[start_i]     if np.isfinite(flow[start_i])     else np.nan
 
-    if np.isnan(p_start) or np.isnan(p_end) or np.isnan(q_start):
-        val_ffr   = 0.0
+    # --- NEW: Segment-average flow over ALL points in the segment (finite only) ---
+    # If you prefer averaging only over valid subgraph points, replace inds_all with inds_valid.
+    qvals = np.array([flow[i] for i in inds_all], dtype=float)
+    qmask = np.isfinite(qvals)
+    q_mean = float(np.mean(qvals[qmask])) if np.any(qmask) else 0.0  # 0.0 if no finite flows
+    segmental_flow_arr[np.array(inds_all, dtype=int)] = q_mean  # paint to all points in the segment
+
+    # Segment FFR using endpoint pressures on this segment chain
+    if np.isnan(p_start) or np.isnan(p_end):
+        val_ffr = 0.0
+    else:
+        val_ffr = (p_end / p_start) if abs(p_start) > FFR_MIN_BASELINE else 0.0
+
+    # Segment Power using pressure drop * segment-average flow
+    if np.isnan(p_start) or np.isnan(p_end) or not np.isfinite(q_mean) or abs(q_mean) <= 0.0:
         val_power = 0.0
     else:
-        val_ffr   = (p_end / p_start) if abs(p_start) > FFR_MIN_BASELINE else 0.0
-        val_power = (p_start - p_end) * q_start
+        val_power = (p_start - p_end) * q_mean
 
     seg_inds_all = np.array(inds_all, dtype=int)
     segment_ffr_per_branch[seg_inds_all] = val_ffr
@@ -276,8 +313,7 @@ for s in unique_segments:
 
 # --------------------------------
 # TOPOLOGICAL BRANCHING (authoritative)
-# Build true branches from the inlet-rooted tree:
-#   Branch = maximal chain from (root or junction) → (junction or leaf)
+# Build branches: maximal chains from (root/junction) → (junction/leaf)
 # --------------------------------
 is_endpoint = np.zeros(num_points, dtype=bool)
 for i in valid_idx:
@@ -287,26 +323,21 @@ for i in valid_idx:
 
 branches = []  # list of dicts with: {'id', 'up_node', 'down_node', 'nodes'}
 end_node_to_branch = {}  # map downstream endpoint → branch_id
-
 branch_id_counter = 0
 
-# Start at all upstream endpoints; launch a branch along each outgoing child
+# Start at upstream endpoints; launch a branch along each outgoing child
 for u in valid_idx:
     if not is_endpoint[u]:
         continue
-    # For a root or junction, explore each outgoing child as a new branch
     for c in children[u] if len(children[u]) > 0 else []:
-        # Walk down until next endpoint
         nodes = []
         curr = c
         while True:
             nodes.append(curr)
             if is_endpoint[curr]:
                 break
-            # exactly one child by construction here
             nxts = children[curr]
             if len(nxts) != 1:
-                # Safety: if label got weird, break to avoid loop
                 break
             curr = nxts[0]
         b = {
@@ -319,8 +350,7 @@ for u in valid_idx:
         end_node_to_branch[curr] = branch_id_counter
         branch_id_counter += 1
 
-# Handle the special case: a root endpoint with **no children** (isolated root)
-# (rare on centerlines, but just in case — make a 0-length branch)
+# Special case: isolated root with no children → a 0-length branch
 for u in valid_idx:
     if is_endpoint[u] and len(children[u]) == 0:
         b = {
@@ -337,14 +367,13 @@ num_branches = len(branches)
 
 # --------------------------------
 # Build branch parent relationships
-# Parent branch of branch B is the branch whose down_node equals B.up_node
+# Parent branch of branch B is the branch whose down_node == B.up_node
 # --------------------------------
 branch_parent = np.full(num_branches, -1, dtype=np.int64)
-upnode_to_branch = {}  # for quick lookup if needed
+upnode_to_branch = {}
 for b in branches:
     upnode_to_branch[b['up_node']] = b['id']
 
-# Create mapping from endpoint nodes to branch ids (already have end_node_to_branch)
 for b in branches:
     up = b['up_node']
     if up in end_node_to_branch:
@@ -360,14 +389,12 @@ for b in branches:
     branch_mean_pressure[b['id']] = float(np.mean(ps[m])) if np.any(m) else np.nan
 
 # --------------------------------
-# Branch FFR (z-branch_FFR): child_mean / parent_mean; trunks = 1.0; undefined = 100
+# Branch FFR (z-branch_FFR): child_mean / parent_mean; trunks = 1.0; undefined = UNDEFINED_FILL_VALUE
 # --------------------------------
 z_branch_ffr_vals = np.full(num_branches, UNDEFINED_FILL_VALUE, dtype=float)
 messages = []
 
-# Identify trunk branches: those with branch_parent == -1
 trunks = [b['id'] for b in branches if branch_parent[b['id']] < 0]
-
 for bid in trunks:
     z_branch_ffr_vals[bid] = 1.0  # trunk FFR
 
@@ -375,8 +402,8 @@ for b in branches:
     bid = b['id']
     par = int(branch_parent[bid])
     if par < 0:
-        continue  # already set to 1.0 for trunk
-    child_mean = branch_mean_pressure[bid]
+        continue
+    child_mean  = branch_mean_pressure[bid]
     parent_mean = branch_mean_pressure[par]
     if (not np.isfinite(child_mean)) or (not np.isfinite(parent_mean)) or (abs(parent_mean) <= FFR_MIN_BASELINE):
         z_branch_ffr_vals[bid] = UNDEFINED_FILL_VALUE
@@ -406,11 +433,8 @@ for b in branches:
     z_branch_ffr_arr[pts]    = z_branch_ffr_vals[b['id']]
 
 # --------------------------------
-# OPTIONAL: keep your earlier segment-by-average arrays (for continuity)
-# We will compute a simple edge-based parent for segments to fill these; note that
-# the authoritative topology is given by z-branch_* arrays above.
+# Optional: segment graph + FFR by pressure average (child/parent of segments)
 # --------------------------------
-# Edge-based (parent[v] -> v) segment transitions; choose earliest (min dist[v])
 seg_parent_map   = {}
 seg_boundary_dist = {}
 for v in valid_idx:
@@ -422,11 +446,8 @@ for v in valid_idx:
         continue
     dv = float(dist[v])
     if (sv not in seg_parent_map) or (dv < seg_boundary_dist[sv]):
-        seg_parent_map[sv]   = su
+        seg_parent_map[sv]    = su
         seg_boundary_dist[sv] = dv
-
-segment_ffr_by_pressure_avg = np.full(num_points, UNDEFINED_FILL_VALUE, dtype=float)
-parent_branch_seg_arr       = np.full(num_points, -1, dtype=np.int64)
 
 # Determine segment roots (contain inlet points or no parent mapping)
 seg_roots = set(int(segment_id[i]) for i in inlet_idx if valid_mask[int(i)])
@@ -438,15 +459,14 @@ seg_children = {}
 for child_seg, par_seg in seg_parent_map.items():
     seg_children.setdefault(par_seg, []).append(child_seg)
 
-# Traverse segment graph from roots
+# Traverse from roots to assign Segment_FFR_byPressureAverage
 visited_segments = set()
 queue = list(seg_roots)
 for r in seg_roots:
     visited_segments.add(int(r))
     inds = np.array(seg_to_indices.get(int(r), []), dtype=int)
     if inds.size > 0:
-        segment_ffr_by_pressure_avg[inds] = 1.0
-        parent_branch_seg_arr[inds] = -1
+        segment_ffr_by_pressure_avg[inds] = 1.0  # trunk segments = 1.0
 
 while queue:
     par = int(queue.pop(0))
@@ -472,7 +492,6 @@ while queue:
         inds = np.array(seg_to_indices.get(ch, []), dtype=int)
         if inds.size > 0:
             segment_ffr_by_pressure_avg[inds] = val
-            parent_branch_seg_arr[inds] = par
         visited_segments.add(ch)
         queue.append(ch)
 
@@ -482,17 +501,20 @@ while queue:
 out = self.GetOutput()
 out.DeepCopy(poly)
 
-# Existing arrays (unchanged)
+# Per-point arrays
 add_point_array(out, "Power_PressureDrop", power_pd)
+
+# Segment-level arrays (painted to points)
+add_point_array(out, "Segmental_Flow", segmental_flow_arr)                 # NEW
 add_point_array(out, "Segment_Power_PressureDrop", segment_power_pd)
 add_point_array(out, "Segment_PressureAverage", segment_pressure_avg)
 add_point_array(out, "Segment_FFR_perBranch", segment_ffr_per_branch)
+add_point_array(out, "Segment_FFR_byPressureAverage", segment_ffr_by_pressure_avg)
 
-
-# NEW: Topology-true branch arrays (authoritative)
+# Topology-true branch arrays
 add_point_array(out, "z-branch_ID", z_branch_id_arr)
 add_point_array(out, "z-branch_Parent", z_branch_parent_arr)
-add_point_array(out, "Segment_FFR_byPressureAverage", z_branch_ffr_arr)
+add_point_array(out, "z-branch_FFR", z_branch_ffr_arr)
 
 # Log messages (undefined cases etc.)
 if LOG_UNDEFINED and len(messages) > 0:

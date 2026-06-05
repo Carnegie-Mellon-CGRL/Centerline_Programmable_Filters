@@ -1,0 +1,18 @@
+
+from vtkmodules.util import numpy_support
+
+# Input
+polydata = self.GetInput()
+
+# List of array names to remove
+arrays_to_remove = ["Segment-Flow_Inlet", "Segment-Flow_Median","Segment-Flow_MedianAverage","Segment-Flow_Outlet","Segment-Power_UsingMedian","Segment-Power_UsingMedianAverage","average_pressure", "average_speed", "capPoints", "centerlineIds", "filtered_Radius_Initial", "globalElementID", "globalNodeID", "groupIds", "onAnyPathFlag","pathOrder","power_byPressuresValuePerPoint",
+"segment_LowerQuartile_AvgRadius","segment_Power_Average","slice_Normal","sphereRadius","timeDeriv","tractIds","vWSS","vinplane_traction","vtkValidPointMask","z-branch_FFR","z-branch_Id","z-branch_Parent","z-extra_FFR","z-extra_Outlet_ID","z-branch_ID"]  # <-- Add array names here, e.g., ["FilteredRadius", "WrongRadius"]
+
+# Remove specified arrays from PointData
+point_data = polydata.GetPointData()
+for name in arrays_to_remove:
+    if point_data.HasArray(name):
+        point_data.RemoveArray(name)
+
+# Output
+output.ShallowCopy(polydata)
