@@ -1,8 +1,8 @@
-# WALT: Workflow for Analysis of Lumen Transport
+# WALT: WSS, Area, Length, Tortuosity
 
 ## Overview
 
-**WALT** is a ParaView-based pipeline for processing vascular centerlines and integrating computational simulation outputs (e.g., pressure, velocity, wall shear stress) to derive geometric and hemodynamic metrics.
+**Centerline_Programmable_Filters** is a ParaView-based pipeline for processing vascular centerlines and integrating computational simulation outputs (e.g., pressure, velocity, wall shear stress) to derive geometric and hemodynamic metrics.
 
 The workflow is designed to produce reproducible, point-wise and segment-wise measurements along vascular networks, including:
 
