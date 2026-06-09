@@ -1,4 +1,4 @@
-# WALT: WSS, Area, Length, Tortuosity
+# 3D to 1D Extraction of Metrics from Simvascular Simulations
 
 ## Overview
 
