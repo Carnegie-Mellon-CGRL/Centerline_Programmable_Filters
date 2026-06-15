@@ -48,15 +48,15 @@ This pipeline maps simulation data onto centerlines and computes foundational ge
 
 5. **Filter 3: `Centerline_Find_Segment_Lengths`**
    - Identifies:
-     - **Inlet**: The point with minimal distance to the inflow boundary and associated with the first `CenterlineID`
-     - **Outlets**: All points connected to only **one neighboring point**
+     - **Inlet**: The point with minimal distance to the inflow boundary as associated with the first `CenterlineID`
+     - **Outlets**: All points connected to only **one neighboring point** as determined by a constructed connectivity matrix
    - Computes path lengths using **Breadth-First Search (BFS)**:
      - Distances are accumulated point-to-point from inlet to each outlet
      - Connectivity determines traversal order
 
 6. **Filter 4: `Identify_Bifurcation_Points`**
    - Identifies branching regions via:
-     - Points with **≥ 3 connections**
+     - Points with **≥ 3 connections** determined by the connectivity matrix
      - Segments where the `Blanking` array begins
    - Assigns **CapPoints**, representing the **start and end of bifurcation regions**
 
@@ -70,22 +70,23 @@ This pipeline maps simulation data onto centerlines and computes foundational ge
    - Determines local vessel radius by:
      - Slicing each segment at CapPoints
      - Measuring the **maximum radial distance from centerline point to surface geometry**
+     - Applies this radius to all points forward in the BFS until reaching the next CapPoint, at which it reslices
 
 9. **CellToPointData**
    - Converts all arrays to **point-associated data**
 
-10. **Group with `.vtp`**
-
 ---
 
 ### 1.4 Surface Sampling
+
+10. **Group with `.vtp`**
 
 11. **Filter 6: `VTP_WSS_only`**
    - Computes **radius-filtered average WSS** by:
      - Slicing the surface (`.vtp`) at each centerline point
      - Averaging all **non-zero WSS values**
    - In branching regions:
-     - Slice is restricted to points within the radius determined by **Filter 5**
+     - Slice is restricted to points within 1.4x the radius determined by **Filter 5**
 
 12. **Group with `.vtu`**
 
@@ -94,7 +95,7 @@ This pipeline maps simulation data onto centerlines and computes foundational ge
      - Slicing volumetric data (`.vtu`)
      - Integrating area across slice
    - In branching regions:
-     - Slice is restricted using previously computed radius
+     - Slice is restricted using 1.4x the previously computed radius from Filter 5
 
 ---
 
@@ -124,7 +125,8 @@ This step improves spatial consistency and computes higher-order physiological m
      - Increments by **1 at each branching point** (≥ 3 connections)
 
 11. **Filter 10: `Round_up_Blanking_Values`**
-   - Adjusts values to prevent interpolation artifacts introduced during resampling
+   - Adjusts values of points to prevent interpolation artifacts introduced during resampling
+   - Any value in arrays such as Blanking greater than 0 are rounded up to 1.
 
 12. **Filter 11: `inlet_outlet_and_lengths`**
    - Recomputes:
@@ -147,7 +149,7 @@ This step improves spatial consistency and computes higher-order physiological m
      - Evaluated via slicing at each centerline point
 
 16. **Filter 13: `Resistance`**
-   - Computes **Ohm’s Law resistance**:
+   - Computes **Ohm’s Law resistance** at each point with pressure differences calculated compared to the prior point:
      - \( R = \frac{\Delta P}{Q} \)
 
 17. **Filter 14: `True_Resistance`**
@@ -165,6 +167,7 @@ This step improves spatial consistency and computes higher-order physiological m
    - Defines segments:
      - A segment is the region **between two bifurcation points**
      - `segmentID` increments at each branch
+     - Segments with fewer than 20 points (less than 0.2 cm long) have their segment ID value replaced with NAN
    - Computes:
      - **Segment-wise Ohm’s resistance**:
        - Pressure drop from segment start to end × flow near segment end
@@ -230,11 +233,12 @@ This step improves spatial consistency and computes higher-order physiological m
 
 - **`Filtered_Area`**  
   - Area computed via slicing  
-  - In branching regions, restricted to radius-defined neighborhood  
+  - In branching regions, restricted to radius-defined neighborhood (1.4x the CapPoint radius)
 
 - **`Filtered_Average_WSS`**  
   - Mean WSS from slice  
-  - Only non-zero values included  
+  - Only non-zero values included
+  - In branching regions, restricted to radius-defined neighborhood (1.4x the CapPoint radius)
 
 - **`Filtered_Radius`**  
   - Radius used to restrict slicing  
@@ -332,7 +336,7 @@ A **segment is defined as points between two bifurcations**.
 
 ## Auxiliary Arrays
 
-Used for intermediate computation or bookkeeping:
+Used for intermediate computation:
 
 - Simulation-derived:
   - `pressure`, `velocity`, `average_pressure`, `average_speed`
@@ -356,10 +360,11 @@ Used for intermediate computation or bookkeeping:
 
 ## Notes
 
-- Arrays in ParaView appear **alphabetically**, not in pipeline order  
+- Arrays in ParaView appear in pipeline order  
 - Segment definitions strictly follow **bifurcation topology**  
 - Radius-restricted slicing is critical to avoid **branch contamination**  
-- Resampling ensures **uniform spatial resolution**, improving numerical stability  
+- Resampling ensures **uniform spatial resolution**, improving numerical stability
+- These scripts were written with non-standard 3D models in mind, and as such some scripts have leniencies built in to obtain full model values
 
 ---
 
